@@ -1,32 +1,60 @@
 from __future__ import annotations
 
 import logging
-from typing import Any
+import re
+from typing import Any, Callable
 
 from ..core.parsing import extract_json_value
 from ..llm.client import LLMClient
+from ..system_prompts import MASTER_SYSTEM_PROMPT
 
 logger = logging.getLogger(__name__)
 
+_EXPLICIT_HIERARCHY_DIRECTIVE = re.compile(
+    r"(?:^|[\n。；;！!])\s*"
+    r"(?:请|帮我|我想|please\s+)?"
+    r"(?:调用|使用|启用|开启|创建|派出|让|use|invoke|spawn|create|call)\s*"
+    r"(?:多个|多|multi[-\s]?|multiple\s+)?"
+    r"(?:agent|agents|subagent|subagents|代理|智能体)",
+    re.IGNORECASE,
+)
+
 DECOMPOSITION_PROMPT = """\
-You are helping the Master Agent design a bounded execution plan. Create a Head \
-only when a sub-problem needs an accountable owner. Do not split work merely to \
-increase parallelism.
+You are routing work for a Master Agent that is the primary executor. Delegation is
+optional. The Master can reason, answer, and call available tools itself. Create Heads
+only when delegation has a concrete benefit; never create a generic Head merely to
+process the request.
 
 Rules:
-1. Use 1-4 Heads. Prefer fewer Heads with coherent ownership.
-2. Each Head owns an end-to-end deliverable, not just a mechanical step.
-3. Identify real dependencies. Independent Heads may run in parallel.
-4. Give every Head an explicit scope and acceptance criteria.
-5. A Head may solve work itself or create bounded Node assignments later.
+0. The user's explicit execution preference is authoritative. If Delegation requirement
+   below says FORCED, mode must be hierarchical with concrete Head contracts. Never
+   silently downgrade an explicit request to use multiple agents into direct execution.
+1. Default to mode=direct for conversation, explanation, translation, summarization,
+   a cohesive single-owner task, or a task needing only a few ordinary tool calls.
+2. Use mode=hierarchical only when one or more of these is true: independent work can
+   run in parallel; distinct expertise/context needs isolation; an independent check is
+   valuable; or the work is too large for one coherent execution context.
+3. Complexity alone does not require delegation. Use 1-4 Heads only when each has a
+   real end-to-end responsibility that remains useful after integration.
+4. For direct work that can be answered immediately, put the complete user-facing
+   answer in direct_response. If tools or further execution are needed, leave
+   direct_response empty and describe the work in direct_instruction.
+5. For hierarchical work, direct_response must be empty and every Head needs explicit
+   scope, deliverable, acceptance criteria, and real dependencies.
 
 User request: {request}
 
-Available tool categories (from skills index):
+Delegation requirement: {delegation_requirement}
+
+Available tool categories (from the tool registry, not Agent Skills):
 {tool_categories}
 
 Return a JSON object:
 {{
+    "mode": "direct|hierarchical",
+    "reason": "why delegation does or does not add value",
+    "direct_response": "complete answer when it is already available, otherwise empty",
+    "direct_instruction": "what Master should execute directly when tools/work are needed",
     "sub_tasks": [
         {{
             "role": "short_role_name",
@@ -42,6 +70,21 @@ Return a JSON object:
 }}
 """
 
+FORCED_HIERARCHY_REPAIR_PROMPT = """\
+Repair an invalid routing decision. The user explicitly required multiple agents, so a
+direct plan is not allowed. Create 1-4 concrete, non-overlapping Head contracts that
+collectively satisfy the current cumulative request. Use multiple Heads when there are
+real independent review or execution tracks; a Head may later decide it needs zero or
+more Nodes. Do not answer the user directly.
+
+User request: {request}
+
+Available tool categories: {tool_categories}
+
+Return the same routing JSON schema with mode="hierarchical", an empty
+direct_response, and at least one fully specified sub_task.
+"""
+
 ADAPTED_DECOMPOSITION_PROMPT = """\
 Adapt this plan template for the current task. Fill in specifics.
 
@@ -55,6 +98,10 @@ Available tool categories:
 
 Return a JSON object with the same structure as the template but with specifics filled in:
 {{
+    "mode": "direct|hierarchical",
+    "reason": "why this mode is appropriate",
+    "direct_response": "complete direct answer or empty",
+    "direct_instruction": "direct execution instruction or empty",
     "sub_tasks": [
         {{
             "role": "short_role_name",
@@ -72,44 +119,102 @@ Return a JSON object with the same structure as the template but with specifics 
 
 
 class TaskDecomposer:
-    """Decomposes user requests into sub-tasks for Head Agents."""
+    """Route coherent work to Master or decompose work that benefits from Heads."""
 
-    def __init__(self, llm_client: LLMClient):
+    def __init__(
+        self,
+        llm_client: LLMClient,
+        system_prompt: str = MASTER_SYSTEM_PROMPT,
+    ):
         self.llm_client = llm_client
+        self.system_prompt = system_prompt
 
     async def decompose(
         self,
         request: str,
         tool_categories: list[str] | None = None,
+        force_hierarchical: bool | None = None,
+        runtime_awareness: str | Callable[[], str] | None = None,
     ) -> dict[str, Any]:
-        """Decompose a user request into sub-tasks from scratch."""
+        """Choose direct Master execution or a bounded Head task graph."""
         cats_str = ", ".join(tool_categories) if tool_categories else "not specified"
+        forced = (
+            self.explicit_hierarchy_requested(request)
+            if force_hierarchical is None
+            else force_hierarchical
+        )
         messages = [
+            {"role": "system", "content": self.system_prompt},
+            *self._runtime_messages(runtime_awareness),
             {"role": "user", "content": DECOMPOSITION_PROMPT.format(
+                request=request,
+                tool_categories=cats_str,
+                delegation_requirement=(
+                    "FORCED by the user's explicit request"
+                    if forced else "AUTO; use the smallest useful organization"
+                ),
+            )},
+        ]
+        raw = await self.llm_client.chat_text(messages, temperature=0.2, max_tokens=1200)
+        plan = self._parse_plan(raw)
+        if not forced or (plan.get("mode") == "hierarchical" and plan.get("sub_tasks")):
+            return plan
+
+        repair_messages = [
+            {"role": "system", "content": self.system_prompt},
+            *self._runtime_messages(runtime_awareness),
+            {"role": "user", "content": FORCED_HIERARCHY_REPAIR_PROMPT.format(
                 request=request,
                 tool_categories=cats_str,
             )},
         ]
-        raw = await self.llm_client.chat_text(messages, temperature=0.4)
-        return self._parse_plan(raw)
+        repaired_raw = await self.llm_client.chat_text(
+            repair_messages,
+            temperature=0.1,
+            max_tokens=1600,
+        )
+        repaired = self._parse_plan(repaired_raw)
+        if repaired.get("mode") != "hierarchical" or not repaired.get("sub_tasks"):
+            raise RuntimeError(
+                "The planner did not produce a valid hierarchy for the user's explicit "
+                "multi-agent request; refusing to silently execute it as Master-only."
+            )
+        return repaired
+
+    @staticmethod
+    def explicit_hierarchy_requested(text: str) -> bool:
+        """Recognize an explicit runtime-control directive, not general topic mentions."""
+        return bool(_EXPLICIT_HIERARCHY_DIRECTIVE.search(text.strip()))
 
     async def decompose_from_template(
         self,
         request: str,
         template: str,
         tool_categories: list[str] | None = None,
+        runtime_awareness: str | Callable[[], str] | None = None,
     ) -> dict[str, Any]:
         """Adapt a cached plan template for a new request."""
         cats_str = ", ".join(tool_categories) if tool_categories else "not specified"
         messages = [
+            {"role": "system", "content": self.system_prompt},
+            *self._runtime_messages(runtime_awareness),
             {"role": "user", "content": ADAPTED_DECOMPOSITION_PROMPT.format(
                 template=template,
                 request=request,
                 tool_categories=cats_str,
             )},
         ]
-        raw = await self.llm_client.chat_text(messages, temperature=0.3)
+        raw = await self.llm_client.chat_text(messages, temperature=0.2, max_tokens=1200)
         return self._parse_plan(raw)
+
+    @staticmethod
+    def _runtime_messages(
+        awareness: str | Callable[[], str] | None,
+    ) -> list[dict[str, str]]:
+        if awareness is None:
+            return []
+        content = awareness() if callable(awareness) else awareness
+        return [{"role": "system", "content": content}] if content else []
 
     @staticmethod
     def _parse_plan(raw: str) -> dict[str, Any]:
@@ -117,20 +222,14 @@ class TaskDecomposer:
         if plan and isinstance(plan.get("sub_tasks"), list):
             return TaskDecomposer._normalize_plan(plan)
 
-        logger.warning("Failed to parse decomposition, returning raw")
+        logger.warning("Failed to parse routing decision; keeping work at Master")
         return {
-            "sub_tasks": [
-                {
-                    "role": "general_executor",
-                    "description": raw,
-                    "scope": raw,
-                    "expected_output": "task result",
-                    "acceptance_criteria": ["Provide a useful result for the request"],
-                    "dependencies": [],
-                    "suggested_tool_categories": [],
-                }
-            ],
-            "overall_strategy": "Single-agent fallback",
+            "mode": "direct",
+            "reason": "Routing output was malformed; do not create speculative agents.",
+            "direct_response": "",
+            "direct_instruction": "Complete the original user request directly.",
+            "sub_tasks": [],
+            "overall_strategy": "Master direct fallback",
         }
 
     @staticmethod
@@ -161,16 +260,17 @@ class TaskDecomposer:
                 "suggested_tool_categories": list(item.get("suggested_tool_categories", [])),
             })
 
-        if not tasks:
-            tasks = [{
-                "role": "general_owner",
-                "description": "Complete the user request",
-                "scope": "The full user request",
-                "expected_output": "A complete response",
-                "acceptance_criteria": ["Address the user request"],
-                "dependencies": [],
-                "suggested_tool_categories": [],
-            }]
+        mode = str(plan.get("mode") or ("hierarchical" if tasks else "direct")).lower()
+        if mode not in {"direct", "hierarchical"}:
+            mode = "direct"
+        direct_response = str(plan.get("direct_response") or "").strip()
+        direct_instruction = str(plan.get("direct_instruction") or "").strip()
+        if mode == "direct":
+            tasks = []
+        elif not tasks:
+            # A hierarchy without owned work is not a valid topology.
+            mode = "direct"
+            direct_instruction = direct_instruction or "Complete the original request directly."
 
         roles = {item["role"] for item in tasks}
         for item in tasks:
@@ -181,6 +281,10 @@ class TaskDecomposer:
             ))
 
         return {
+            "mode": mode,
+            "reason": str(plan.get("reason") or ""),
             "sub_tasks": tasks,
             "overall_strategy": str(plan.get("overall_strategy") or "Bounded hierarchical execution"),
+            "direct_response": direct_response,
+            "direct_instruction": direct_instruction,
         }

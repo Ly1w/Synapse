@@ -19,9 +19,11 @@ from agent_framework.core.node_agent import NodeAgent
 from agent_framework.llm.config import LLMConfig
 from agent_framework.planning.decomposer import TaskDecomposer
 from agent_framework.runtime.run import RunJournal, RunStatus
+from agent_framework.skills import SkillCatalog
 from agent_framework.tools.registry import ToolRegistry
 from agent_framework.tools.executor import ToolExecutor
-from agent_framework.tools.mcp_provider import MCPServerConfig, MCPToolProvider
+from agent_framework.tools.mcp_provider import MCPServerConfig
+from agent_framework.tools.permissions import ApprovalContext
 from deep_research import fetch as research_fetch
 from deep_research import notes as research_notes
 from deep_research import report as research_report
@@ -36,17 +38,31 @@ def _completion(content: str = "", tool_calls: list | None = None):
 class DeterministicLLM:
     def __init__(self, gate_node: bool = False):
         self.gate_node = gate_node
+        self.chat_text_calls = 0
         self.node_started = asyncio.Event()
         self.node_release = asyncio.Event()
+        self.route_messages = []
         if not gate_node:
             self.node_release.set()
 
     async def chat_text(self, messages, **kwargs):
+        self.chat_text_calls += 1
         prompt = str(messages[-1].get("content", ""))
         if "Extract the core intent" in prompt:
             return "runtime_test"
-        if "bounded execution plan" in prompt:
+        if "routing work for a Master Agent" in prompt:
+            self.route_messages = list(messages)
+            if "User request: 你好" in prompt:
+                return json.dumps({
+                    "mode": "direct",
+                    "reason": "No delegation benefit",
+                    "direct_response": "你好！有什么我可以帮你的吗？",
+                    "direct_instruction": "",
+                    "sub_tasks": [],
+                    "overall_strategy": "Master answers directly",
+                })
             return json.dumps({
+                "mode": "hierarchical",
                 "sub_tasks": [{
                     "role": "research_owner",
                     "description": "Produce the requested result",
@@ -56,6 +72,8 @@ class DeterministicLLM:
                     "dependencies": [],
                 }],
                 "overall_strategy": "One accountable Head",
+                "direct_response": "",
+                "direct_instruction": "",
             })
         if "Prepare a bounded execution strategy" in prompt:
             return json.dumps({
@@ -95,12 +113,10 @@ class DeterministicLLM:
                 "unresolved": [],
                 "follow_up_tasks": [],
             })
-        if "Produce the Master checkpoint" in prompt:
+        if "Produce the final response addressed directly" in prompt:
             return "FINAL REVISED" if "master-only" in prompt else "FINAL"
         if "Extract a reusable plan template" in prompt:
             return "one accountable owner followed by validation"
-        if "tool indexing assistant" in prompt:
-            return "# Skills Index"
         return json.dumps({"action": "defer", "reason": "No expansion needed"})
 
     async def chat_with_tools(self, messages, tools, **kwargs):
@@ -136,17 +152,174 @@ class RepeatingDiscoveryLLM:
         return "unused"
 
 
+class AwarenessCaptureLLM:
+    def __init__(self):
+        self.calls = []
+
+    async def chat_with_tools(self, messages, tools, **kwargs):
+        self.calls.append(list(messages))
+        return _completion(json.dumps({
+            "status": "completed",
+            "summary": "captured",
+            "evidence": [],
+            "unresolved": [],
+        }))
+
+    async def chat_text(self, messages, **kwargs):
+        self.calls.append(list(messages))
+        return "captured"
+
+
+class DirectToolLLM:
+    def __init__(self):
+        self.tool_turns = 0
+
+    async def chat_text(self, messages, **kwargs):
+        prompt = str(messages[-1].get("content", ""))
+        if "routing work for a Master Agent" in prompt:
+            return json.dumps({
+                "mode": "direct",
+                "reason": "One tool call is sufficient",
+                "direct_response": "",
+                "direct_instruction": "Call echo once and answer",
+                "sub_tasks": [],
+                "overall_strategy": "Master direct tool use",
+            })
+        return "TOOL RESULT DELIVERED"
+
+    async def chat_with_tools(self, messages, tools, **kwargs):
+        self.tool_turns += 1
+        if self.tool_turns == 1:
+            call = SimpleNamespace(
+                id="call_echo",
+                function=SimpleNamespace(
+                    name="echo",
+                    arguments=json.dumps({"text": "payload"}),
+                ),
+            )
+            return _completion(tool_calls=[call])
+        call = SimpleNamespace(
+            id="call_finish",
+            function=SimpleNamespace(
+                name="framework_commit_response",
+                arguments=json.dumps({"response": "TOOL RESULT DELIVERED"}),
+            ),
+        )
+        return _completion(tool_calls=[call])
+
+
+class ProgressThenFinishLLM:
+    def __init__(self):
+        self.tool_turns = 0
+
+    async def chat_text(self, messages, **kwargs):
+        prompt = str(messages[-1].get("content", ""))
+        if "routing work for a Master Agent" in prompt:
+            return json.dumps({
+                "mode": "direct",
+                "reason": "Master can inspect this directly",
+                "direct_response": "",
+                "direct_instruction": "Inspect and report",
+                "sub_tasks": [],
+                "overall_strategy": "Direct inspection",
+            })
+        return json.dumps({"response": "FALLBACK", "complete": True})
+
+    async def chat_with_tools(self, messages, tools, **kwargs):
+        self.tool_turns += 1
+        assert any(
+            item["function"]["name"] == "framework_commit_response"
+            for item in tools
+        )
+        if self.tool_turns == 1:
+            return _completion("再读取测试文件和剩余核心文件：")
+        call = SimpleNamespace(
+            id="call_finish_after_progress",
+            function=SimpleNamespace(
+                name="framework_commit_response",
+                arguments=json.dumps({"response": "完整审查结果"}, ensure_ascii=False),
+            ),
+        )
+        return _completion(tool_calls=[call])
+
+
+class ForcedHierarchyLLM(DeterministicLLM):
+    async def chat_text(self, messages, **kwargs):
+        prompt = str(messages[-1].get("content", ""))
+        if "routing work for a Master Agent" in prompt:
+            self.chat_text_calls += 1
+            if "Additional user requirements:" not in prompt:
+                return json.dumps({
+                    "mode": "direct",
+                    "reason": "Greeting",
+                    "direct_response": "初始回复",
+                    "direct_instruction": "",
+                    "sub_tasks": [],
+                    "overall_strategy": "Direct greeting",
+                })
+            # Deliberately violate the explicit preference. The decomposer must repair it.
+            return json.dumps({
+                "mode": "direct",
+                "reason": "Incorrect direct downgrade",
+                "direct_response": "",
+                "direct_instruction": "Review directly",
+                "sub_tasks": [],
+                "overall_strategy": "Invalid",
+            })
+        if "Repair an invalid routing decision" in prompt:
+            self.chat_text_calls += 1
+            return json.dumps({
+                "mode": "hierarchical",
+                "reason": "User explicitly required multiple agents",
+                "direct_response": "",
+                "direct_instruction": "",
+                "sub_tasks": [{
+                    "role": "code_review_owner",
+                    "description": "Review the requested repository",
+                    "scope": "Read-only code review",
+                    "expected_output": "Evidence-backed findings",
+                    "acceptance_criteria": ["Core files and tests are reviewed"],
+                    "dependencies": [],
+                }],
+                "overall_strategy": "Head-owned review with bounded Node work",
+            })
+        return await super().chat_text(messages, **kwargs)
+
+
+class DirectRevisionLLM:
+    def __init__(self):
+        self.route_count = 0
+
+    async def chat_text(self, messages, **kwargs):
+        prompt = str(messages[-1].get("content", ""))
+        if "routing work for a Master Agent" in prompt:
+            self.route_count += 1
+            revised = "Additional user requirements:" in prompt
+            return json.dumps({
+                "mode": "direct",
+                "reason": "The Master owns this coherent request",
+                "direct_response": "DIRECT TWO" if revised else "DIRECT ONE",
+                "direct_instruction": "",
+                "sub_tasks": [],
+                "overall_strategy": "Master answers directly",
+            })
+        return "unused"
+
+    async def chat_with_tools(self, messages, tools, **kwargs):
+        return _completion("unused")
+
+
 def _make_master(tmp_path: Path, fake: DeterministicLLM) -> MasterAgent:
     master = MasterAgent(
         LLMConfig(api_key="test", model="fake"),
         memory_root=str(tmp_path / "memory"),
         cache_dir=str(tmp_path / "cache"),
         run_root=str(tmp_path / "runs"),
+        workspace_root=str(tmp_path),
     )
     master.llm_client = fake
     master.task_decomposer.llm_client = fake
     master.plan_cache.llm_client = fake
-    master.skills_generator.llm_client = fake
     master._lightweight_client = fake
     master._executor_client = fake
     return master
@@ -164,6 +337,21 @@ def test_end_to_end_run_is_retained_and_explicitly_archived(tmp_path: Path):
         assert state["status"] == RunStatus.COMPLETED_RETAINED.value
         assert len(state["live_agents"]) == 3  # Master, Head, and retained Node
         assert master.agent_registry.count == 3
+        head = next(iter(master._run_heads[run_id].values()))
+        assert head.contract.context["user_request"] == "Do the work"
+        node = next(iter(head._node_agents.values()))
+        assert node.contract.context["user_request"] == "Do the work"
+        assert "<current_task_contract>" in head.system_prompt
+        assert "Do the work" in node.system_prompt
+        assert "Permission mode: auto" in node.system_prompt
+        head_awareness = head.runtime_awareness()
+        node_awareness = node.runtime_awareness()
+        assert '"level": "Head"' in head_awareness
+        assert '"parent_master_id"' in head_awareness
+        assert '"node_slots_remaining"' in head_awareness
+        assert '"level": "Node"' in node_awareness
+        assert '"parent_head_id"' in node_awareness
+        assert '"business_tool_call_limit": null' in node_awareness
         run_dir = tmp_path / "runs" / run_id
         assert (run_dir / "events.jsonl").exists()
         assert len(list((run_dir / "agents").glob("*.json"))) == 3
@@ -177,6 +365,248 @@ def test_end_to_end_run_is_retained_and_explicitly_archived(tmp_path: Path):
         assert archived_master["final_response"] == "FINAL"
 
     asyncio.run(scenario())
+
+
+def test_router_keeps_greeting_at_master_without_delegation(tmp_path: Path):
+    async def scenario():
+        fake = DeterministicLLM()
+        master = _make_master(tmp_path, fake)
+        run_id = await master.start_request("你好")
+        result = await asyncio.wait_for(master.wait_for_run(run_id), timeout=1)
+
+        assert result == "你好！有什么我可以帮你的吗？"
+        assert fake.chat_text_calls == 1
+        assert fake.route_messages[0]["role"] == "system"
+        assert len(fake.route_messages[0]["content"]) > 14_000
+        assert "<delegation_policy>" in fake.route_messages[0]["content"]
+        assert "Bash, Read, Write, Edit, Glob, Grep" in fake.route_messages[0]["content"]
+        assert fake.route_messages[1]["role"] == "system"
+        assert "<runtime_awareness>" in fake.route_messages[1]["content"]
+        assert '"level": "Master"' in fake.route_messages[1]["content"]
+        assert '"phase"' in fake.route_messages[1]["content"]
+        assert '"queued_user_revisions": 0' in fake.route_messages[1]["content"]
+        state = await master.get_run_state(run_id)
+        assert state["status"] == RunStatus.COMPLETED_RETAINED.value
+        assert state["topology"]["heads"] == []
+        assert state["live_agents"] == [master.id]
+        events = await master.get_run_events(run_id)
+        assert events[-1]["type"] == "run_checkpoint_committed"
+
+    asyncio.run(scenario())
+
+
+def test_runtime_awareness_refreshes_each_turn_without_polluting_context(tmp_path: Path):
+    async def scenario():
+        router = Router()
+        router.register("master", AgentRole.MASTER)
+        router.register("head", AgentRole.HEAD, "master", run_id="aware-run")
+        node_channel = router.register(
+            "node", AgentRole.NODE, "head", run_id="aware-run"
+        )
+        fake = AwarenessCaptureLLM()
+        node = NodeAgent(
+            agent_id="node",
+            role="focused_reader",
+            task="inspect one file",
+            head_id="head",
+            llm_client=fake,
+            router=router,
+            channel=node_channel,
+            tool_registry=ToolRegistry(),
+            contract=TaskContract(
+                role="focused_reader",
+                goal="inspect one file",
+                scope="read-only",
+                deliverable="one finding",
+            ),
+            budget=AgentBudget(
+                max_turns=4,
+                max_peer_messages=2,
+                max_discoveries=1,
+                max_children=0,
+                max_revision_rounds=0,
+                timeout_seconds=5,
+            ),
+            run_id="aware-run",
+        )
+        node._running = True
+        node._phase = "contract_execution"
+        node.start_clock()
+
+        await node.think_with_tools("first", [])
+        node._tool_call_count = 7
+        node._sent_counts[MessageType.PEER_REQUEST] = 1
+        node.add_runtime_observation("tool Read", "failed", "path was missing")
+        node._started_at -= 4.5
+        await node.think_with_tools("second", [])
+
+        first = fake.calls[0][0]["content"]
+        second = fake.calls[1][0]["content"]
+        assert "<runtime_awareness>" in first
+        assert '"remaining_turns_after_this_call": 3' in first
+        assert '"peer_messages_remaining": 2' in first
+        assert '"remaining_turns_after_this_call": 2' in second
+        assert '"peer_messages_remaining": 1' in second
+        assert '"business_tool_calls_observed": 7' in second
+        assert "tool Read: failed (path was missing)" in second
+        assert "critical: stop exploration and synthesize the best result now" in second
+        assert "max_tool_calls" not in second
+
+        retained = node.context.export_state()
+        assert '"elapsed_seconds":' not in retained["system_prompt"]
+        assert all(
+            '"elapsed_seconds":' not in str(message.get("content", ""))
+            for message in retained["messages"]
+        )
+
+    asyncio.run(scenario())
+
+
+def test_simple_tool_task_stays_with_master(tmp_path: Path):
+    async def scenario():
+        fake = DirectToolLLM()
+        master = _make_master(tmp_path, fake)
+
+        async def echo(text: str):
+            return {"echo": text}
+
+        master.tool_registry.register(
+            "echo",
+            "Echo a value",
+            {
+                "type": "object",
+                "properties": {"text": {"type": "string"}},
+                "required": ["text"],
+            },
+            category="utility",
+            callable_fn=echo,
+        )
+        run_id = await master.start_request("Use the echo tool once")
+        result = await asyncio.wait_for(master.wait_for_run(run_id), timeout=2)
+
+        assert result == "TOOL RESULT DELIVERED"
+        state = await master.get_run_state(run_id)
+        assert state["topology"]["heads"] == []
+        events = await master.get_run_events(run_id)
+        assert any(
+            item["type"] == "tool_call" and item["payload"].get("owner") == "master"
+            for item in events
+        )
+
+    asyncio.run(scenario())
+
+
+def test_master_does_not_commit_progress_narration_as_final_response(tmp_path: Path):
+    async def scenario():
+        fake = ProgressThenFinishLLM()
+        master = _make_master(tmp_path, fake)
+        run_id = await master.start_request("审查代码")
+        result = await asyncio.wait_for(master.wait_for_run(run_id), timeout=2)
+
+        assert result == "完整审查结果"
+        assert fake.tool_turns == 2
+        state = await master.get_run_state(run_id)
+        assert state["final_response"] == "完整审查结果"
+        assert state["checkpoints"][0]["response"] == "完整审查结果"
+
+    asyncio.run(scenario())
+
+
+def test_tool_calls_have_no_arbitrary_cumulative_budget(tmp_path: Path):
+    async def scenario():
+        master = _make_master(tmp_path, DeterministicLLM())
+
+        async def echo(value: int):
+            return {"value": value}
+
+        master.tool_registry.register(
+            "counted_echo",
+            "Return one integer",
+            {
+                "type": "object",
+                "properties": {"value": {"type": "integer"}},
+                "required": ["value"],
+            },
+            callable_fn=echo,
+        )
+        for value in range(40):
+            call = SimpleNamespace(function=SimpleNamespace(
+                name="counted_echo",
+                arguments=json.dumps({"value": value}),
+            ))
+            result = json.loads(await master._execute_master_tool_call("no-run", call))
+            assert result == {"value": value}
+        assert "max_tool_calls" not in AgentBudget().model_dump()
+
+    asyncio.run(scenario())
+
+
+def test_completed_master_only_run_can_be_revised_without_creating_agents(tmp_path: Path):
+    async def scenario():
+        fake = DirectRevisionLLM()
+        master = _make_master(tmp_path, fake)
+        run_id = await master.start_request("Give me one direct answer")
+
+        assert await master.wait_for_run(run_id) == "DIRECT ONE"
+        agent_ids = set(master.agent_registry.get_all_ids())
+        assert agent_ids == {master.id}
+
+        revision = await master.steer(run_id, "Now revise that answer")
+        assert revision == 1
+        assert await asyncio.wait_for(master.wait_for_run(run_id), timeout=2) == "DIRECT TWO"
+        assert set(master.agent_registry.get_all_ids()) == agent_ids
+        state = await master.get_run_state(run_id)
+        assert state["revision"] == 1
+        assert state["topology"]["heads"] == []
+        assert [item["response"] for item in state["checkpoints"]] == [
+            "DIRECT ONE",
+            "DIRECT TWO",
+        ]
+        assert [item["revision"] for item in state["checkpoints"]] == [0, 1]
+        assert fake.route_count == 2
+
+    asyncio.run(scenario())
+
+
+def test_explicit_multi_agent_revision_creates_visible_live_topology(tmp_path: Path):
+    async def scenario():
+        fake = ForcedHierarchyLLM(gate_node=True)
+        master = _make_master(tmp_path, fake)
+        run_id = await master.start_request("你好，介绍一下你自己")
+        assert await master.wait_for_run(run_id) == "初始回复"
+
+        revision = await master.steer(
+            run_id,
+            "调用多agent，审查代码，只读不要做任何修改",
+        )
+        assert revision == 1
+        await asyncio.wait_for(fake.node_started.wait(), timeout=2)
+
+        live = await master.get_run_state(run_id)
+        assert live["status"] == RunStatus.RUNNING.value
+        assert len(live["topology"]["heads"]) == 1
+        assert len(live["topology"]["heads"][0]["nodes"]) == 1
+        assert len(live["agent_ids"]) == 3
+
+        fake.node_release.set()
+        assert await asyncio.wait_for(master.wait_for_run(run_id), timeout=5) == "FINAL"
+        settled = await master.get_run_state(run_id)
+        assert [item["revision"] for item in settled["checkpoints"]] == [0, 1]
+        assert [item["response"] for item in settled["checkpoints"]] == [
+            "初始回复",
+            "FINAL",
+        ]
+        events = await master.get_run_events(run_id)
+        assert sum(item["type"] == "agent_registered" for item in events) == 3
+
+    asyncio.run(scenario())
+
+
+def test_explicit_multi_agent_detection_is_a_control_directive():
+    assert TaskDecomposer.explicit_hierarchy_requested("调用多agent，审查代码")
+    assert TaskDecomposer.explicit_hierarchy_requested("Please use multiple agents to review")
+    assert not TaskDecomposer.explicit_hierarchy_requested("介绍一下多agent系统的设计")
+    assert not TaskDecomposer.explicit_hierarchy_requested("不要调用多agent")
 
 
 def test_running_run_accepts_user_update(tmp_path: Path):
@@ -282,7 +712,6 @@ def test_node_discovery_budget_prevents_message_storm(tmp_path: Path):
             contract=TaskContract(role="worker", goal="bounded task"),
             budget=AgentBudget(
                 max_turns=3,
-                max_tool_calls=0,
                 max_peer_messages=0,
                 max_discoveries=1,
                 max_children=0,
@@ -329,6 +758,16 @@ def test_plan_is_bounded_and_roles_are_unique():
     roles = [item["role"] for item in plan["sub_tasks"]]
     assert len(roles) == 4
     assert len(set(roles)) == 4
+
+
+def test_plan_can_keep_work_at_master_without_creating_a_head():
+    plan = TaskDecomposer._parse_plan(json.dumps({
+        "sub_tasks": [],
+        "overall_strategy": "Master answers directly",
+        "direct_response": "A direct user-facing answer",
+    }))
+    assert plan["sub_tasks"] == []
+    assert plan["direct_response"] == "A direct user-facing answer"
 
 
 def test_context_compaction_keeps_tool_call_with_results():
@@ -413,33 +852,237 @@ def test_keyless_web_search_normalizes_results_and_domain_filters(monkeypatch):
     assert "cannot be used together" in conflict["error"]
 
 
-def test_local_web_search_mcp_registers_and_executes_tools():
+def test_web_search_is_builtin_and_user_mcp_tools_are_namespaced(tmp_path: Path):
     async def scenario():
-        registry = ToolRegistry()
-        provider = MCPToolProvider(MCPServerConfig(
-            name="test-web-search",
+        master = _make_master(tmp_path, DeterministicLLM())
+        assert {"WebSearch", "WebFetch"}.issubset(master.get_tool_info()["builtin"])
+        result = await master.tool_executor.execute(
+            "WebFetch",
+            {"url": "http://127.0.0.1/private"},
+        )
+        assert "not allowed" in result
+
+        names = await master.connect_mcp_server(MCPServerConfig(
+            name="test-extra",
             command=sys.executable,
-            args=("-m", "agent_framework.tools.web_search_server"),
+            args=(str(Path(__file__).parents[1] / "mcp_server.py"),),
             cwd=Path(__file__).parents[1],
-            tool_allowlist=frozenset({"tool_search_web", "tool_fetch_webpage"}),
-            category="web_search",
+            tool_allowlist=frozenset({"tool_get_session"}),
+            category="mcp:test-extra",
         ))
         try:
-            names = await provider.connect(registry)
-            assert set(names) == {"tool_search_web", "tool_fetch_webpage"}
-            schema = registry.get("tool_search_web").parameters
-            assert "allowed_domains" in schema["properties"]
-
-            result = await ToolExecutor(registry).execute(
-                "tool_fetch_webpage",
-                {"url": "http://127.0.0.1/private"},
-            )
-            assert "not allowed" in result
+            assert names == ["mcp__test_extra__tool_get_session"]
+            tool = master.tool_registry.get(names[0])
+            assert tool is not None
+            assert tool.source == "mcp:test-extra"
+            assert tool.permission_scope == "mcp"
+            call_task = asyncio.create_task(master.tool_executor.execute(names[0], {}))
+            await asyncio.sleep(0)
+            approval = master.list_pending_approvals()[0]
+            assert approval["tool_name"] == names[0]
+            assert approval["risk"] == "mcp"
+            await master.resolve_approval(approval["approval_id"], False)
+            denied = await call_task
+            assert "denied by the user" in denied["error"]
         finally:
-            await provider.close()
-        assert registry.get_names() == []
+            await master.disconnect_mcp_server("test-extra")
+        assert not master.get_tool_info()["mcp"]
 
     asyncio.run(scenario())
+
+
+def test_permission_gate_approves_or_denies_one_concrete_tool_call(tmp_path: Path):
+    async def scenario():
+        master = _make_master(tmp_path, DeterministicLLM())
+        master.set_permission_mode("ask")
+        journal = RunJournal("permission test", root_dir=tmp_path / "approval-runs")
+        await journal.initialize()
+        context = ApprovalContext(
+            run_id=journal.run_id,
+            agent_id=master.id,
+            task_id="permission-task",
+            journal=journal,
+        )
+
+        approved_path = tmp_path / "approved.txt"
+        approved_task = asyncio.create_task(master.tool_executor.execute(
+            "Write",
+            {"path": str(approved_path), "content": "approved"},
+            context,
+        ))
+        await asyncio.sleep(0)
+        pending = master.list_pending_approvals()
+        assert len(pending) == 1
+        assert not approved_path.exists()
+        await master.resolve_approval(pending[0]["approval_id"], True)
+        approved_result = await approved_task
+        assert approved_result["bytes_written"] == 8
+        assert approved_path.read_text() == "approved"
+
+        denied_path = tmp_path / "denied.txt"
+        denied_task = asyncio.create_task(master.tool_executor.execute(
+            "Write",
+            {"path": str(denied_path), "content": "denied"},
+            context,
+        ))
+        await asyncio.sleep(0)
+        denied = master.list_pending_approvals()[0]
+        await master.resolve_approval(denied["approval_id"], False)
+        denied_result = await denied_task
+        assert "denied by the user" in denied_result["error"]
+        assert not denied_path.exists()
+
+        events = await journal.read_events()
+        assert [item["type"] for item in events].count("approval_requested") == 2
+        assert [item["type"] for item in events].count("approval_resolved") == 2
+
+        master.set_permission_mode("auto")
+        automatic_path = tmp_path / "automatic.txt"
+        automatic = await master.tool_executor.execute(
+            "Write",
+            {"path": str(automatic_path), "content": "workspace write"},
+            context,
+        )
+        assert automatic["bytes_written"] == 15
+        assert master.list_pending_approvals() == []
+
+        shell_path = tmp_path / "shell.txt"
+        shell_task = asyncio.create_task(master.tool_executor.execute(
+            "Bash",
+            {"command": f"touch {shell_path}"},
+            context,
+        ))
+        await asyncio.sleep(0)
+        shell_approval = master.list_pending_approvals()[0]
+        assert shell_approval["risk"] in {"shell", "unsafe_shell"}
+        await master.resolve_approval(shell_approval["approval_id"], False)
+        await shell_task
+        assert not shell_path.exists()
+
+        master.set_permission_mode("full")
+        full_result = await master.tool_executor.execute(
+            "Bash",
+            {"command": f"touch {shell_path}"},
+            context,
+        )
+        assert full_result["exit_code"] == 0
+        assert shell_path.exists()
+        assert "Permission mode: full" in master.system_prompt
+
+    asyncio.run(scenario())
+
+
+def test_builtin_coding_tools_cover_read_edit_glob_grep_and_skill(tmp_path: Path):
+    async def scenario():
+        master = _make_master(tmp_path, DeterministicLLM())
+        source = tmp_path / "src" / "sample.py"
+        written = await master.tool_executor.execute(
+            "Write",
+            {"path": str(source), "content": "VALUE = 1\nprint(VALUE)\n"},
+        )
+        assert written["bytes_written"] > 0
+
+        edited = await master.tool_executor.execute(
+            "Edit",
+            {
+                "path": str(source),
+                "old_string": "VALUE = 1",
+                "new_string": "VALUE = 2",
+            },
+        )
+        assert edited["replacements"] == 1
+        read = await master.tool_executor.execute(
+            "Read", {"path": str(source), "offset": 1, "limit": 10}
+        )
+        assert "VALUE = 2" in read["content"]
+        assert read["content"].startswith("     1\t")
+
+        matches = await master.tool_executor.execute(
+            "Glob", {"pattern": "**/*.py", "path": str(tmp_path)}
+        )
+        assert str(source) in matches["matches"]
+        grep = await master.tool_executor.execute(
+            "Grep",
+            {"pattern": r"print\(VALUE\)", "path": str(tmp_path), "glob": "*.py"},
+        )
+        assert grep["matched_files"] == 1
+        assert grep["results"][0]["line"] == 2
+
+        skill_file = tmp_path / ".synapse" / "skills" / "review" / "SKILL.md"
+        await master.tool_executor.execute(
+            "Write",
+            {
+                "path": str(skill_file),
+                "content": (
+                    "---\n"
+                    "name: review\n"
+                    "description: Review the current code diff for defects.\n"
+                    "allowed-tools: [Read, Grep, Bash]\n"
+                    "---\n"
+                    "# Review\nInspect the current diff. Focus: $ARGUMENTS. First: $0."
+                ),
+            },
+        )
+        skills = await master.tool_executor.execute("Skill", {"name": "list"})
+        assert skills["skills"][0]["name"] == "review"
+        assert skills["skills"][0]["description"].startswith("Review the current")
+        skill = await master.tool_executor.execute(
+            "Skill", {"name": "review", "arguments": "focus on correctness"}
+        )
+        assert "Inspect the current diff" in skill["instructions"]
+        assert "Focus: focus on correctness" in skill["instructions"]
+        assert "First: focus" in skill["instructions"]
+        master.set_permission_mode("auto")
+        assert '<skill name="review"' in master.system_prompt
+
+        pwd = await master.tool_executor.execute("Bash", {"command": "pwd"})
+        assert pwd["exit_code"] == 0
+        assert pwd["stdout"].strip() == str(tmp_path)
+        assert master.list_pending_approvals() == []
+
+    asyncio.run(scenario())
+
+
+def test_skill_catalog_uses_real_skill_metadata_and_explicit_precedence(tmp_path: Path):
+    low = tmp_path / "low"
+    high = tmp_path / "high"
+    for root, marker in ((low, "LOW"), (high, "HIGH")):
+        path = root / "review" / "SKILL.md"
+        path.parent.mkdir(parents=True)
+        path.write_text(
+            "---\n"
+            "name: review\n"
+            f"description: {marker} precedence review workflow.\n"
+            "---\n"
+            f"{marker}: inspect $0 with ${{SKILL_DIR}}. All args: $ARGUMENTS",
+            encoding="utf-8",
+        )
+
+    disabled = high / "manual" / "SKILL.md"
+    disabled.parent.mkdir(parents=True)
+    disabled.write_text(
+        "---\n"
+        "name: manual\n"
+        "description: A user-only workflow.\n"
+        "disable-model-invocation: true\n"
+        "---\n"
+        "Do the manual operation.",
+        encoding="utf-8",
+    )
+
+    catalog = SkillCatalog(tmp_path, [low, high])
+    listed = {item["name"]: item for item in catalog.list_skills()}
+    assert listed["review"]["description"].startswith("HIGH")
+    assert listed["review"]["source"] == "configured"
+    assert listed["manual"]["model_invocable"] is False
+    assert '<skill name="review"' in catalog.model_inventory()
+    assert '<skill name="manual"' not in catalog.model_inventory()
+
+    loaded = catalog.load("review", 'src/main.py "strict mode"')
+    assert loaded["instructions"].startswith("HIGH: inspect src/main.py")
+    assert "All args: src/main.py \"strict mode\"" in loaded["instructions"]
+    assert loaded["base_directory"] == str((high / "review").resolve())
+    assert "error" in catalog.load("manual")
 
 
 def test_web_control_room_runs_against_the_real_runtime_api(tmp_path: Path):
@@ -448,14 +1091,25 @@ def test_web_control_room_runs_against_the_real_runtime_api(tmp_path: Path):
     web_module.master = _make_master(tmp_path, DeterministicLLM())
     try:
         with TestClient(web_module.app) as client:
-            assert client.get("/").status_code == 200
-            assert "Synapse" in client.get("/").text
-            assert client.get("/static/app.js").status_code == 200
-            mcp_health = client.get("/api/health").json()["mcp"]
-            assert mcp_health["status"] == "connected"
-            assert set(mcp_health["tools"]) == {
-                "tool_search_web", "tool_fetch_webpage"
+            index_response = client.get("/")
+            assert index_response.status_code == 200
+            assert "Synapse" in index_response.text
+            assert 'id="guidanceThread"' in index_response.text
+            assert "MASTER CHECKPOINTS" in index_response.text
+            script_response = client.get("/static/app.js")
+            assert script_response.status_code == 200
+            assert "pendingSteersFor" in script_response.text
+            assert "checkpoint-message" in script_response.text
+            health = client.get("/api/health").json()
+            assert health["search"] == {
+                "status": "ready", "tools": ["WebSearch", "WebFetch"]
             }
+            assert health["mcp"]["servers"] == []
+            assert {"Bash", "Read", "Write", "Edit", "Glob", "Grep", "Skill"}.issubset(
+                set(health["tools"]["builtin"])
+            )
+            assert client.put("/api/permissions", json={"mode": "ask"}).json()["mode"] == "ask"
+            assert client.get("/api/permissions").json()["pending"] == []
 
             created = client.post("/api/runs", json={"request": "Do the web work"})
             assert created.status_code == 202
@@ -484,6 +1138,14 @@ def test_web_control_room_runs_against_the_real_runtime_api(tmp_path: Path):
             )
             assert revised.status_code == 202
             assert revised.json()["revision"] == 1
+            revised_state = client.get(f"/api/runs/{run_id}").json()
+            assert revised_state["requirements"][-1] == "master-only: make the final concise"
+            revised_events = client.get(f"/api/runs/{run_id}/events").json()["events"]
+            assert any(
+                event["type"] == "user_update"
+                and event["payload"]["text"] == "master-only: make the final concise"
+                for event in revised_events
+            )
             assert client.post("/api/runs", json={"request": "   "}).status_code == 422
     finally:
         web_module.master = previous_master

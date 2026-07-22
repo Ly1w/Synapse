@@ -7,6 +7,7 @@ import logging
 from typing import Any
 
 from .registry import ToolRegistry
+from .permissions import ApprovalContext, PermissionManager
 
 logger = logging.getLogger(__name__)
 
@@ -14,10 +15,20 @@ logger = logging.getLogger(__name__)
 class ToolExecutor:
     """Executes registered tool callables by name with given arguments."""
 
-    def __init__(self, registry: ToolRegistry):
+    def __init__(
+        self,
+        registry: ToolRegistry,
+        permission_manager: PermissionManager | None = None,
+    ):
         self.registry = registry
+        self.permission_manager = permission_manager
 
-    async def execute(self, tool_name: str, arguments: dict[str, Any] | str) -> Any:
+    async def execute(
+        self,
+        tool_name: str,
+        arguments: dict[str, Any] | str,
+        approval_context: ApprovalContext | None = None,
+    ) -> Any:
         tool = self.registry.get(tool_name)
         if tool is None:
             return {"error": f"Tool '{tool_name}' not found"}
@@ -29,6 +40,19 @@ class ToolExecutor:
                 arguments = json.loads(arguments)
             except json.JSONDecodeError:
                 return {"error": f"Failed to parse arguments: {arguments}"}
+
+        if self.permission_manager is not None:
+            allowed, reason, risk = await self.permission_manager.authorize(
+                tool,
+                arguments,
+                approval_context,
+            )
+            if not allowed:
+                return {
+                    "error": f"Tool '{tool_name}' was denied by the user",
+                    "reason": reason,
+                    "risk": risk,
+                }
 
         try:
             if inspect.iscoroutinefunction(tool.callable):

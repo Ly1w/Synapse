@@ -4,6 +4,5 @@ tiktoken
 aiofiles
 mcp[cli]>=1.20,<2
 httpx
-beautifulsoup4
 fastapi
 uvicorn[standard]

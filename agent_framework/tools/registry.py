@@ -1,8 +1,7 @@
 from __future__ import annotations
 
-import json
 import logging
-from typing import Any, Callable, Awaitable
+from typing import Any, Callable
 
 from pydantic import BaseModel, ConfigDict, Field
 
@@ -16,6 +15,8 @@ class ToolDef(BaseModel):
     description: str
     parameters: dict[str, Any] = Field(default_factory=dict)
     category: str = ""
+    source: str = "custom"
+    permission_scope: str = "safe"
     callable: Any = Field(default=None, exclude=True)
 
     model_config = ConfigDict(arbitrary_types_allowed=True)
@@ -30,13 +31,6 @@ class ToolDef(BaseModel):
                 "parameters": self.parameters,
             },
         }
-
-    def to_index_line(self) -> str:
-        """One-line summary for skills.md index."""
-        params = self.parameters.get("properties", {})
-        param_str = ", ".join(params.keys()) if params else ""
-        return f"- `{self.name}({param_str})`: {self.description}"
-
 
 class ToolRegistry:
     """
@@ -56,14 +50,20 @@ class ToolRegistry:
         parameters: dict[str, Any] | None = None,
         category: str = "",
         callable_fn: Callable[..., Any] | None = None,
+        source: str = "custom",
+        permission_scope: str = "safe",
     ) -> ToolDef:
         if name.startswith("framework_"):
             raise ValueError("Tool names beginning with 'framework_' are reserved")
+        if name in self._tools:
+            raise ValueError(f"Tool name is already registered: {name}")
         tool = ToolDef(
             name=name,
             description=description,
             parameters=parameters or {"type": "object", "properties": {}},
             category=category,
+            source=source,
+            permission_scope=permission_scope,
             callable=callable_fn,
         )
         self._tools[name] = tool
@@ -75,6 +75,8 @@ class ToolRegistry:
         schema: dict[str, Any],
         category: str = "",
         callable_fn: Callable[..., Any] | None = None,
+        source: str = "custom",
+        permission_scope: str = "safe",
     ) -> ToolDef:
         """Register a tool from an OpenAI-style function schema."""
         func = schema.get("function", schema)
@@ -84,6 +86,8 @@ class ToolRegistry:
             parameters=func.get("parameters"),
             category=category or str(schema.get("category") or func.get("category") or ""),
             callable_fn=callable_fn,
+            source=source,
+            permission_scope=permission_scope,
         )
 
     def register_batch(
@@ -97,6 +101,11 @@ class ToolRegistry:
         for schema in schemas:
             func = schema.get("function", schema)
             name = func["name"]
+            existing = self.get(name)
+            if existing is not None:
+                if existing.source == "builtin" or existing.source.startswith("mcp:"):
+                    raise ValueError(f"Tool name is reserved by {existing.source}: {name}")
+                self.unregister(name)
             results.append(
                 self.register_from_schema(schema, callable_fn=callables.get(name))
             )

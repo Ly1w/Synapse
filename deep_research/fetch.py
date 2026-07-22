@@ -8,9 +8,9 @@ from typing import Optional
 from urllib.parse import urljoin, urlparse
 
 import httpx
-from bs4 import BeautifulSoup
 
 from .config import SEMANTIC_SCHOLAR_BASE_URL
+from .html_parser import ReadableHTMLParser
 
 _MAX_WEBPAGE_CHARS = 8000
 
@@ -43,25 +43,10 @@ def _validate_public_http_url(url: str) -> str | None:
 
 def _extract_text(html: str) -> str:
     """Extract clean readable text from HTML, stripping boilerplate."""
-    soup = BeautifulSoup(html, "html.parser")
-
-    # Remove non-content tags
-    for tag in soup(["script", "style", "nav", "footer", "header", "aside", "form"]):
-        tag.decompose()
-
-    # Prefer article/main content if available
-    main = soup.find("article") or soup.find("main") or soup.find("body") or soup
-
-    paragraphs = []
-    for elem in main.find_all(["p", "h1", "h2", "h3", "h4", "li"]):
-        text = elem.get_text(separator=" ", strip=True)
-        if len(text) > 30:
-            paragraphs.append(text)
-
-    text = "\n\n".join(paragraphs)
-    # Collapse excessive whitespace
-    text = re.sub(r"\n{3,}", "\n\n", text)
-    return text
+    parser = ReadableHTMLParser()
+    parser.feed(html[:2_000_000])
+    parser.close()
+    return re.sub(r"\n{3,}", "\n\n", parser.text())
 
 
 def fetch_webpage(url: str, max_chars: int = _MAX_WEBPAGE_CHARS) -> str:
@@ -105,11 +90,11 @@ def fetch_webpage(url: str, max_chars: int = _MAX_WEBPAGE_CHARS) -> str:
             {"error": f"Non-HTML content type: {content_type}", "url": url}
         )
 
-    soup = BeautifulSoup(resp.text, "html.parser")
-    title_tag = soup.find("title")
-    title = title_tag.get_text(strip=True) if title_tag else ""
-
-    text = _extract_text(resp.text)
+    parser = ReadableHTMLParser()
+    parser.feed(resp.text[:2_000_000])
+    parser.close()
+    title = parser.title
+    text = re.sub(r"\n{3,}", "\n\n", parser.text())
     truncated = len(text) > max_chars
     return json.dumps(
         {

@@ -1,8 +1,12 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
+import re
 from collections import defaultdict
+from dataclasses import replace
+from pathlib import Path
 from typing import Any, Coroutine
 
 from ..communication.message import Message, MessageType
@@ -15,8 +19,10 @@ from ..memory.plan_cache import PlanCache
 from ..planning.decomposer import TaskDecomposer
 from ..planning.progress import ProgressTracker, TaskProgress, TaskStatus
 from ..runtime.run import RunJournal, RunStatus, redact_state
-from ..skills.generator import SkillsGenerator
-from ..skills.reader import SkillsReader
+from ..system_prompts import build_master_system_prompt
+from ..tools.builtin import register_builtin_tools
+from ..tools.executor import ToolExecutor
+from ..tools.permissions import ApprovalContext, PermissionManager, PermissionMode
 from ..tools.registry import ToolRegistry
 from ..tools.mcp_provider import MCPServerConfig, MCPToolProvider
 from .base_agent import BaseAgent
@@ -28,20 +34,28 @@ from .registry import AgentRegistry
 logger = logging.getLogger(__name__)
 
 
-MASTER_SYSTEM_PROMPT = """\
-You are the Master Agent and global problem owner in a hierarchical multi-agent system.
-
-Your responsibilities:
-1. Interpret the user's evolving requirements and maintain a bounded task graph.
-2. Give each Head an end-to-end contract with scope and acceptance criteria.
-3. Schedule real dependencies, arbitrate cross-Head discoveries, and limit expansion.
-4. Apply user updates while a run is active; decide what must be revised.
-5. Validate coverage and contradictions before committing a response.
-
-You do not perform low-level business tool work, but you are responsible for the
-quality and convergence of the complete answer. A final response is a retained
-checkpoint: the run and its agents may be resumed by later user guidance.
-"""
+def _master_finish_tool_schema() -> dict[str, Any]:
+    return {
+        "type": "function",
+        "function": {
+            "name": "framework_commit_response",
+            "description": (
+                "Commit the complete user-facing answer and end this Master execution "
+                "phase. Do not call this for plans, progress notes, or text describing "
+                "work that remains to be done."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "response": {
+                        "type": "string",
+                        "description": "Complete final response addressed to the user.",
+                    },
+                },
+                "required": ["response"],
+            },
+        },
+    }
 
 
 class MasterAgent(BaseAgent):
@@ -59,6 +73,8 @@ class MasterAgent(BaseAgent):
         head_budget: AgentBudget | None = None,
         node_budget: AgentBudget | None = None,
         retained_run_limit: int | None = 8,
+        workspace_root: str | None = None,
+        permission_mode: PermissionMode | str = PermissionMode.AUTO,
     ):
         config = llm_config or LLMConfig()
         if isinstance(config, FrameworkLLMConfig):
@@ -70,6 +86,13 @@ class MasterAgent(BaseAgent):
         self._lightweight_client = LLMClient(self._framework_config.get_lightweight())
         self._executor_client = LLMClient(self._framework_config.get_executor())
         self.tool_registry = tool_registry or ToolRegistry()
+        self.workspace_root = Path(workspace_root or Path.cwd()).expanduser().resolve()
+        self.permission_manager = PermissionManager(self.workspace_root, permission_mode)
+        self._builtin_toolset = register_builtin_tools(
+            self.tool_registry,
+            self.workspace_root,
+        )
+        self.tool_executor = ToolExecutor(self.tool_registry, self.permission_manager)
         self.agent_registry = AgentRegistry()
         self.router = Router()
 
@@ -80,12 +103,8 @@ class MasterAgent(BaseAgent):
         self.retained_run_limit = retained_run_limit
         self.memory_store = MemoryStore("master", memory_root)
         self.plan_cache = PlanCache(self._lightweight_client, cache_dir)
-        self.skills_generator = SkillsGenerator(self._lightweight_client)
-        self.task_decomposer = TaskDecomposer(planner_client)
-
         self.head_budget = head_budget or AgentBudget(
             max_turns=20,
-            max_tool_calls=4,
             max_peer_messages=4,
             max_discoveries=2,
             max_children=4,
@@ -94,7 +113,6 @@ class MasterAgent(BaseAgent):
         )
         self.node_budget = node_budget or AgentBudget(
             max_turns=10,
-            max_tool_calls=10,
             max_peer_messages=2,
             max_discoveries=1,
             max_children=0,
@@ -103,18 +121,31 @@ class MasterAgent(BaseAgent):
         )
         master_budget = budget or AgentBudget(
             max_turns=30,
-            max_tool_calls=0,
             max_peer_messages=0,
             max_discoveries=2,
             max_children=6,
-            max_revision_rounds=2,
+            # User steering is never consumed as an internal synthesis-repair round.
+            max_revision_rounds=0,
             timeout_seconds=1800,
+        )
+        master_system_prompt = build_master_system_prompt(
+            master_budget,
+            self.head_budget,
+            self.node_budget,
+            str(self.workspace_root),
+            self.permission_manager.mode.value,
+            [item.name for item in self.tool_registry.get_all() if item.source == "builtin"],
+            self._builtin_toolset.skill_catalog.model_inventory(),
+        )
+        self.task_decomposer = TaskDecomposer(
+            planner_client,
+            system_prompt=master_system_prompt,
         )
 
         super().__init__(
             agent_id=master_id,
             role="master",
-            system_prompt=MASTER_SYSTEM_PROMPT,
+            system_prompt=master_system_prompt,
             llm_client=planner_client,
             router=self.router,
             channel=channel,
@@ -123,8 +154,6 @@ class MasterAgent(BaseAgent):
         )
         self.agent_registry.register(self, {"role": "master"})
 
-        self._skills_index = ""
-        self._skills_reader: SkillsReader | None = None
         self._run_journals: dict[str, RunJournal] = {}
         self._run_tasks: dict[str, asyncio.Task[str]] = {}
         self._run_updates: dict[str, asyncio.Queue[tuple[int, str]]] = {}
@@ -145,6 +174,7 @@ class MasterAgent(BaseAgent):
         self._run_revision_attempts: dict[str, dict[tuple[str, int], int]] = defaultdict(dict)
         self._master_context_states: dict[str, dict[str, Any]] = {}
         self._run_deferred_contracts: dict[str, list[TaskContract]] = defaultdict(list)
+        self._run_master_tool_call_counts: dict[str, int] = defaultdict(int)
         self._mcp_providers: list[MCPToolProvider] = []
         self._cold_run_ids: set[str] = set()
         self._load_persisted_runs()
@@ -168,6 +198,8 @@ class MasterAgent(BaseAgent):
         """Start work in the background and return a run id that can be steered."""
         if any(not task.done() for task in self._run_tasks.values()):
             raise RuntimeError("This Master already has an active run; steer or await it first.")
+        # Skill metadata is cheap to rediscover and may have changed since the last Run.
+        self._refresh_master_system_prompt()
         await self._enforce_retention_limit()
         journal = RunJournal(request, root_dir=self._run_root)
         await journal.initialize()
@@ -297,17 +329,156 @@ class MasterAgent(BaseAgent):
             "executor_model": self._framework_config.get_executor().model,
             "lightweight_model": self._framework_config.get_lightweight().model,
             "base_url": self._framework_config.planner.base_url,
+            "workspace_root": str(self.workspace_root),
         }
+
+    def get_tool_info(self) -> dict[str, Any]:
+        tools = self.tool_registry.get_all()
+        return {
+            "builtin": [item.name for item in tools if item.source == "builtin"],
+            "mcp": [item.name for item in tools if item.source.startswith("mcp:")],
+            "custom": [
+                item.name for item in tools
+                if item.source != "builtin" and not item.source.startswith("mcp:")
+            ],
+        }
+
+    def get_permission_state(self) -> dict[str, Any]:
+        return self.permission_manager.get_state()
+
+    def runtime_state(self) -> dict[str, Any]:
+        state = super().runtime_state()
+        run_id = self.run_id
+        journal = self._run_journals.get(run_id) if run_id else None
+        heads = self._run_heads.get(run_id, {}) if run_id else {}
+        active = self._run_active_head_tasks.get(run_id, {}) if run_id else {}
+        outcomes = self._run_head_outcomes.get(run_id, {}) if run_id else {}
+        manifest = journal.manifest if journal else None
+        tool_items = self.tool_registry.get_all()
+        state.update({
+            "role_position": {
+                "level": "Master",
+                "responsibility": (
+                    "Own the cumulative user request, choose direct or hierarchical "
+                    "execution, integrate evidence, and commit user-facing checkpoints"
+                ),
+                "parent": "user",
+                "may_create": "Head only",
+                "must_not": [
+                    "become a passive dispatcher",
+                    "create Nodes directly",
+                    "commit progress narration as a final response",
+                ],
+            },
+            "current_run": {
+                "status": manifest.status.value if manifest else None,
+                "revision": manifest.revision if manifest else 0,
+                "cumulative_requirement_count": len(manifest.requirements) if manifest else 0,
+                "checkpoint_count": len(manifest.checkpoints) if manifest else 0,
+                "queued_user_revisions": (
+                    self._run_updates[run_id].qsize()
+                    if run_id in self._run_updates else 0
+                ),
+            },
+            "current_topology": {
+                "head_ids": list(heads),
+                "active_head_ids": list(active),
+                "settled_head_phases": sum(len(items) for items in outcomes.values()),
+                "head_slots_used": len(heads),
+                "head_slots_max": self.budget.max_children,
+                "head_slots_remaining": max(0, self.budget.max_children - len(heads)),
+                "inbox_pending": self.channel.pending,
+            },
+            "remaining_coordination": {
+                "head_discoveries_seen": len(
+                    self._run_discoveries.get(run_id, set())
+                ) if run_id else 0,
+                "head_discoveries_max": self.budget.max_discoveries,
+                "head_discoveries_remaining": max(
+                    0,
+                    self.budget.max_discoveries
+                    - len(self._run_discoveries.get(run_id, set())),
+                ) if run_id else self.budget.max_discoveries,
+                "peer_messages_max": 0,
+                "peer_messages_remaining": 0,
+                "user_steering_limit": None,
+            },
+            "current_execution": {
+                "master_business_tool_calls_observed_for_run": (
+                    self._run_master_tool_call_counts.get(run_id, 0) if run_id else 0
+                ),
+                "business_tool_call_limit": None,
+                "business_tool_stop_condition": (
+                    "phase timeout, per-tool timeout, cancellation, or convergence"
+                ),
+                "deferred_head_contracts": len(
+                    self._run_deferred_contracts.get(run_id, [])
+                ) if run_id else 0,
+            },
+            "environment": {
+                "workspace_root": str(self.workspace_root),
+                "permission": self.permission_manager.get_state(),
+                "builtin_tool_count": sum(
+                    1 for item in tool_items if item.source == "builtin"
+                ),
+                "user_extension_tool_count": sum(
+                    1 for item in tool_items if item.source != "builtin"
+                ),
+            },
+        })
+        return state
+
+    def set_permission_mode(self, mode: PermissionMode | str) -> dict[str, Any]:
+        self.permission_manager.set_mode(mode)
+        self._refresh_master_system_prompt()
+        for heads in self._run_heads.values():
+            for head in heads.values():
+                head.refresh_system_prompt()
+        return self.permission_manager.get_state()
+
+    def _refresh_master_system_prompt(self) -> None:
+        prompt = build_master_system_prompt(
+            self.budget,
+            self.head_budget,
+            self.node_budget,
+            str(self.workspace_root),
+            self.permission_manager.mode.value,
+            [item.name for item in self.tool_registry.get_all() if item.source == "builtin"],
+            self._builtin_toolset.skill_catalog.model_inventory(),
+        )
+        self.system_prompt = prompt
+        self.context.set_system_prompt(prompt)
+        self.task_decomposer.system_prompt = prompt
+
+    def list_pending_approvals(self, run_id: str | None = None) -> list[dict[str, Any]]:
+        return self.permission_manager.list_pending(run_id)
+
+    async def resolve_approval(self, approval_id: str, allow: bool) -> dict[str, Any]:
+        return await self.permission_manager.resolve(approval_id, allow)
 
     def get_mcp_status(self) -> list[dict[str, Any]]:
         return [provider.status() for provider in self._mcp_providers]
 
     async def connect_mcp_server(self, config: MCPServerConfig) -> list[str]:
-        """Connect one MCP server and make its allowed tools available to Nodes."""
+        """Connect one user-requested MCP server under an isolated tool namespace."""
+        if any(provider.config.name == config.name for provider in self._mcp_providers):
+            raise ValueError(f"MCP server is already connected: {config.name}")
+        safe_name = re.sub(r"[^A-Za-z0-9_]", "_", config.name).strip("_") or "server"
+        config = replace(config, tool_prefix=f"mcp__{safe_name[:24]}__")
         provider = MCPToolProvider(config)
         names = await provider.connect(self.tool_registry)
         self._mcp_providers.append(provider)
         return names
+
+    async def disconnect_mcp_server(self, name: str) -> None:
+        provider = next(
+            (item for item in self._mcp_providers if item.config.name == name),
+            None,
+        )
+        if provider is None:
+            raise KeyError(f"Unknown MCP server: {name}")
+        self._mcp_providers.remove(provider)
+        await provider.close()
 
     async def close_mcp_servers(self) -> None:
         providers = list(reversed(self._mcp_providers))
@@ -366,34 +537,72 @@ class MasterAgent(BaseAgent):
         try:
             await self._activate_master_context(run_id, fresh=True)
             await journal.register_agent(self.id, "master")
+            await self.record_event("master_step_started", {
+                "step": "planning",
+                "message": "Master is deciding whether this request needs delegation.",
+            })
             await self.memory_store.initialize()
-            await self.plan_cache.initialize()
             memory = await self.memory_store.read()
             if memory:
                 self.context.add_pinned(self.memory_store.get_injection_prompt(memory))
 
             if tools:
                 self.tool_registry.register_batch(tools, tool_callables)
-            self._skills_index = await self._generate_skills_index()
-            self._skills_reader = (
-                SkillsReader(self._skills_index, self.tool_registry, self._lightweight_client)
-                if self._skills_index else None
+
+            tool_categories = list(self.tool_registry.get_categories())
+            plan = await self.task_decomposer.decompose(
+                request,
+                tool_categories,
+                runtime_awareness=self.begin_llm_turn_awareness,
             )
 
-            keyword, cached_entry = await self.plan_cache.lookup(request)
-            tool_categories = list(self.tool_registry.get_categories())
-            if cached_entry:
-                plan = await self.task_decomposer.decompose_from_template(
-                    request, cached_entry.template, tool_categories
+            pending = self._contracts_from_plan(plan, request)
+            await self.record_event("master_step_finished", {
+                "step": "planning",
+                "head_count": len(pending),
+                "direct": not pending,
+            })
+            if not pending:
+                direct_response = str(plan.get("direct_response") or "").strip()
+                if direct_response:
+                    return await self._commit_direct_response(
+                        run_id,
+                        request,
+                        direct_response,
+                        reason="master_direct",
+                    )
+                direct_response = await self._execute_master_direct(
+                    run_id,
+                    request,
+                    str(plan.get("direct_instruction") or ""),
                 )
-            else:
-                plan = await self.task_decomposer.decompose(request, tool_categories)
+                return await self._commit_direct_response(
+                    run_id,
+                    request,
+                    direct_response,
+                    reason="master_direct_execution",
+                )
+
+            # Plan templates and tool retrieval are useful only after Master has
+            # actually chosen delegation. Simple direct work pays none of this cost.
+            await self.plan_cache.initialize()
+            keyword, cached_entry = await self.plan_cache.lookup(request)
+            if cached_entry:
+                adapted = await self.task_decomposer.decompose_from_template(
+                    request,
+                    cached_entry.template,
+                    tool_categories,
+                    runtime_awareness=self.begin_llm_turn_awareness,
+                )
+                adapted_pending = self._contracts_from_plan(adapted, request)
+                if adapted.get("mode") == "hierarchical" and adapted_pending:
+                    plan = adapted
+                    pending = adapted_pending
 
             tracker = ProgressTracker()
             root_progress = tracker.create_root(run_id, request)
             root_progress.mark_in_progress()
             self._run_progress[run_id] = tracker
-            pending = self._contracts_from_plan(plan)
             active: dict[str, asyncio.Task[AgentOutcome]] = {}
             self._run_active_head_tasks[run_id] = active
 
@@ -421,9 +630,12 @@ class MasterAgent(BaseAgent):
             return result
 
     async def _resume_run(self, run_id: str) -> str:
+        self._refresh_master_system_prompt()
         journal = self._run_journals[run_id]
         try:
             await self._activate_master_context(run_id, fresh=False)
+            if not self._run_heads.get(run_id):
+                return await self._resume_master_only_run(run_id)
             tracker = self._run_progress.get(run_id) or ProgressTracker()
             if tracker.root is None:
                 tracker.create_root(run_id, journal.manifest.user_request).mark_in_progress()
@@ -474,7 +686,20 @@ class MasterAgent(BaseAgent):
                     continue
                 root_progress.mark_completed(candidate[:300])
                 await self._retain_master_state(run_id, candidate)
-                await journal.set_status(RunStatus.COMPLETED_RETAINED, candidate)
+                checkpoint = await journal.commit_checkpoint(
+                    candidate,
+                    reason="hierarchical_synthesis",
+                )
+                await journal.record(
+                    "run_checkpoint_committed",
+                    source=self.id,
+                    task_id=run_id,
+                    payload={
+                        "checkpoint_id": checkpoint.checkpoint_id,
+                        "revision": checkpoint.revision,
+                        "response_chars": len(candidate),
+                    },
+                )
                 return candidate
 
     async def _drive_scheduler(
@@ -484,6 +709,7 @@ class MasterAgent(BaseAgent):
         active: dict[str, asyncio.Task[AgentOutcome]],
         root_progress: TaskProgress,
     ) -> None:
+        self._phase = "coordinating_heads"
         while pending or active or not self._run_updates[run_id].empty():
             if self.remaining_seconds <= 0:
                 self._run_deferred_contracts[run_id].extend(pending.values())
@@ -668,6 +894,7 @@ class MasterAgent(BaseAgent):
         active: dict[str, asyncio.Task[AgentOutcome]],
         root_progress: TaskProgress,
     ) -> None:
+        self._phase = "applying_user_revision"
         roles = self._run_head_roles[run_id]
         self.context.add_message({
             "role": "user",
@@ -725,7 +952,10 @@ class MasterAgent(BaseAgent):
         if action == "add_head" and len(self._run_heads[run_id]) < self.budget.max_children:
             spec = decision.get("new_head")
             if isinstance(spec, dict):
-                contract = self._contract_from_spec(spec)
+                contract = self._contract_from_spec(
+                    spec,
+                    self._run_journals[run_id].manifest.user_request,
+                )
                 contract.context[f"user_revision_{revision}"] = update
                 contract.role = self._unique_role(run_id, contract.role, pending)
                 pending[contract.role] = contract
@@ -734,6 +964,7 @@ class MasterAgent(BaseAgent):
             "update": update,
             "decision": decision,
         })
+        self._phase = "coordinating_heads"
 
     async def _handle_master_message(
         self,
@@ -763,6 +994,7 @@ class MasterAgent(BaseAgent):
         active: dict[str, asyncio.Task[AgentOutcome]],
         root_progress: TaskProgress,
     ) -> None:
+        self._phase = "triaging_head_discovery"
         description = str(message.content.get("description") or message.content.get("text") or "")
         fingerprint = " ".join(description.lower().split())[:300]
         seen = self._run_discoveries[run_id]
@@ -795,7 +1027,10 @@ class MasterAgent(BaseAgent):
         elif action == "create_head" and len(self._run_heads[run_id]) < self.budget.max_children:
             spec = decision.get("new_head")
             if isinstance(spec, dict):
-                contract = self._contract_from_spec(spec)
+                contract = self._contract_from_spec(
+                    spec,
+                    self._run_journals[run_id].manifest.user_request,
+                )
                 contract.context["discovery"] = message.content
                 contract.role = self._unique_role(run_id, contract.role, pending)
                 pending[contract.role] = contract
@@ -803,6 +1038,7 @@ class MasterAgent(BaseAgent):
             "discovery": message.content,
             "decision": decision,
         })
+        self._phase = "coordinating_heads"
 
     async def _create_head(
         self,
@@ -829,7 +1065,7 @@ class MasterAgent(BaseAgent):
             channel=channel,
             tool_registry=self.tool_registry,
             agent_registry=self.agent_registry,
-            skills_reader=self._skills_reader,
+            skill_catalog=self._builtin_toolset.skill_catalog,
             peer_roster=self._build_peer_roster(run_id, head_id),
             memory_store=MemoryStore(f"head-{contract.role}", self._memory_root),
             contract=contract,
@@ -837,6 +1073,7 @@ class MasterAgent(BaseAgent):
             child_budget=self.node_budget.model_copy(deep=True),
             run_id=run_id,
             journal=self._run_journals[run_id],
+            permission_manager=self.permission_manager,
         )
         self.agent_registry.register(head, {
             "role": contract.role,
@@ -868,6 +1105,7 @@ class MasterAgent(BaseAgent):
             head.update_peer_roster(self._build_peer_roster(run_id, head_id))
 
     async def _aggregate_final_results(self, run_id: str, original_request: str) -> str:
+        self._phase = "final_synthesis"
         latest = self._latest_outcomes(run_id)
         requirements = self._run_journals[run_id].manifest.requirements
         results = [item.model_dump(mode="json") for item in latest]
@@ -878,9 +1116,16 @@ class MasterAgent(BaseAgent):
         results_for_prompt: Any = results or (
             "No Head result was available; provide the best reasoned response and explain the gap."
         )
-        return await self.think(
-            "Produce the Master checkpoint for the user. Verify coverage against every "
-            "requirement, resolve contradictions between Heads, and disclose remaining gaps. "
+        await self.record_event("master_step_started", {
+            "step": "final_synthesis",
+            "message": "Master is validating results and composing the user response.",
+        })
+        response = await self.think(
+            "Produce the final response addressed directly to the user. Use the user's "
+            "language and answer their actual request. Verify coverage against every "
+            "requirement, resolve contradictions, and disclose material gaps. Do not expose "
+            "the Master/Head/Node workflow, contracts, progress bookkeeping, or return an "
+            "internal JSON validation object unless the user explicitly requested that format. "
             "Do not concatenate reports.\n\n"
             f"Original request: {original_request}\n"
             f"Current requirements: {requirements}\n"
@@ -888,19 +1133,31 @@ class MasterAgent(BaseAgent):
             f"Deferred contracts caused by the hard Head budget: {deferred}\n"
             f"Progress:\n{await self.get_progress_report(run_id)}"
         )
+        await self.record_event("master_step_finished", {
+            "step": "final_synthesis",
+            "message": "Master finished the user-facing response.",
+        })
+        return response
 
-    def _contracts_from_plan(self, plan: dict[str, Any]) -> dict[str, TaskContract]:
+    def _contracts_from_plan(
+        self,
+        plan: dict[str, Any],
+        original_request: str,
+    ) -> dict[str, TaskContract]:
         pending: dict[str, TaskContract] = {}
         for spec in plan.get("sub_tasks", [])[:4]:
             if not isinstance(spec, dict):
                 continue
-            contract = self._contract_from_spec(spec)
+            contract = self._contract_from_spec(spec, original_request)
             contract.role = self._unique_role("", contract.role, pending)
             pending[contract.role] = contract
         return pending
 
     @staticmethod
-    def _contract_from_spec(spec: dict[str, Any]) -> TaskContract:
+    def _contract_from_spec(
+        spec: dict[str, Any],
+        original_request: str = "",
+    ) -> TaskContract:
         goal = str(spec.get("description") or spec.get("goal") or spec.get("task") or "")
         return TaskContract(
             role=str(spec.get("role") or "general_owner"),
@@ -909,7 +1166,286 @@ class MasterAgent(BaseAgent):
             deliverable=str(spec.get("expected_output") or spec.get("deliverable") or "Task result"),
             acceptance_criteria=[str(item) for item in spec.get("acceptance_criteria", [])],
             dependencies=[str(item) for item in spec.get("dependencies", [])],
+            context={"user_request": original_request} if original_request else {},
         )
+
+    async def _commit_direct_response(
+        self,
+        run_id: str,
+        request: str,
+        response: str,
+        reason: str,
+    ) -> str:
+        lock = self._run_locks[run_id]
+        async with lock:
+            if not self._run_updates[run_id].empty():
+                # A steering event arrived while Master was answering. Re-route it
+                # before exposing an already-obsolete checkpoint.
+                reroute = True
+            else:
+                reroute = False
+                return await self._commit_direct_response_locked(
+                    run_id, request, response, reason
+                )
+        if reroute:
+            return await self._resume_master_only_run(run_id)
+        return response
+
+    async def _commit_direct_response_locked(
+        self,
+        run_id: str,
+        request: str,
+        response: str,
+        reason: str,
+    ) -> str:
+        tracker = ProgressTracker()
+        root = tracker.create_root(run_id, request)
+        root.mark_completed(response[:300])
+        self._run_progress[run_id] = tracker
+        self._run_active_head_tasks[run_id] = {}
+        self.context.add_message({"role": "user", "content": request})
+        self.context.add_message({"role": "assistant", "content": response})
+        await self.record_event("master_direct_response", {
+            "reason": reason,
+            "message": "Master answered directly; no delegation was needed.",
+        })
+        await self._retain_master_state(run_id, response)
+        journal = self._run_journals[run_id]
+        checkpoint = await journal.commit_checkpoint(response, reason=reason)
+        await journal.record(
+            "run_checkpoint_committed",
+            source=self.id,
+            task_id=run_id,
+            payload={
+                "checkpoint_id": checkpoint.checkpoint_id,
+                "revision": checkpoint.revision,
+                "response_chars": len(response),
+            },
+        )
+        return response
+
+    async def _resume_master_only_run(self, run_id: str) -> str:
+        """Re-route steering on a retained Master-only Run without inventing a Head."""
+        self._phase = "rerouting_user_revision"
+        journal = self._run_journals[run_id]
+        applied_updates = []
+        while not self._run_updates[run_id].empty():
+            revision, update = self._run_updates[run_id].get_nowait()
+            applied_updates.append((revision, update))
+            await self.record_event("user_update_applied", {
+                "revision": revision,
+                "update": update,
+                "decision": {"action": "reroute_from_master"},
+            })
+
+        requirements = journal.manifest.requirements
+        current_request = requirements[0]
+        if len(requirements) > 1:
+            current_request += "\n\nAdditional user requirements:\n" + "\n".join(
+                f"- {item}" for item in requirements[1:]
+            )
+
+        await self.record_event("master_step_started", {
+            "step": "rerouting",
+            "message": "Master is re-evaluating the retained Run after user guidance.",
+            "revisions": [revision for revision, _ in applied_updates],
+        })
+        tool_categories = list(self.tool_registry.get_categories())
+        force_hierarchical = any(
+            self.task_decomposer.explicit_hierarchy_requested(update)
+            for _, update in applied_updates
+        )
+        plan = await self.task_decomposer.decompose(
+            current_request,
+            tool_categories,
+            force_hierarchical=force_hierarchical,
+            runtime_awareness=self.begin_llm_turn_awareness,
+        )
+        pending = self._contracts_from_plan(plan, current_request)
+        await self.record_event("master_step_finished", {
+            "step": "rerouting",
+            "head_count": len(pending),
+            "direct": not pending,
+        })
+
+        if not pending:
+            response = str(plan.get("direct_response") or "").strip()
+            if not response:
+                response = await self._execute_master_direct(
+                    run_id,
+                    current_request,
+                    str(plan.get("direct_instruction") or ""),
+                )
+            return await self._commit_direct_response(
+                run_id,
+                current_request,
+                response,
+                reason="master_direct_revision",
+            )
+
+        tracker = ProgressTracker()
+        root = tracker.create_root(run_id, current_request)
+        root.mark_in_progress()
+        self._run_progress[run_id] = tracker
+        active: dict[str, asyncio.Task[AgentOutcome]] = {}
+        self._run_active_head_tasks[run_id] = active
+        return await self._drive_and_commit(
+            run_id,
+            current_request,
+            pending,
+            active,
+            root,
+        )
+
+    async def _execute_master_direct(
+        self,
+        run_id: str,
+        request: str,
+        instruction: str,
+    ) -> str:
+        """Let Master complete one coherent task, with bounded ordinary tools."""
+        self._phase = "direct_execution"
+        await self.record_event("master_step_started", {
+            "step": "direct_execution",
+            "message": "Master is completing this request without delegation.",
+        })
+        prompt = (
+            "Complete the user's request yourself. You are the primary executor; Heads and "
+            "Nodes are unnecessary for this task. Use an available tool only when it is "
+            "actually needed. A plain text assistant message is not a final response in "
+            "this phase. When the work is genuinely complete, call "
+            "framework_commit_response exactly once with the complete user-facing answer. "
+            "Never commit a progress note, future-tense action, or unfinished checklist. "
+            "Do not mention routing, agents, contracts, or internal JSON.\n\n"
+            f"User request: {request}\n"
+            f"Routing guidance: {instruction or 'Use your best judgment.'}"
+        )
+        schemas = self.tool_registry.get_openai_schemas() + [_master_finish_tool_schema()]
+
+        current_input = prompt
+        # Reserve one reasoning turn for a truthful best-effort synthesis if ordinary
+        # tool execution does not explicitly commit first.
+        for _ in range(max(0, self.remaining_turns - 1)):
+            if self.remaining_seconds <= 0:
+                break
+            completion = await self.think_with_tools(current_input, schemas)
+            message = completion.choices[0].message
+            if not message.tool_calls:
+                current_input = (
+                    "That was not committed because it was plain assistant text. If work "
+                    "remains, use the necessary tools now. If it is complete, call "
+                    "framework_commit_response with the full final answer."
+                )
+                continue
+
+            finish_calls = [
+                call for call in message.tool_calls
+                if str(call.function.name) == "framework_commit_response"
+            ]
+            business_calls = [
+                call for call in message.tool_calls
+                if str(call.function.name) != "framework_commit_response"
+            ]
+            for tool_call in message.tool_calls:
+                if str(tool_call.function.name) == "framework_commit_response":
+                    continue
+                result = await self._execute_master_tool_call(run_id, tool_call)
+                self.add_tool_result(tool_call.id, result)
+
+            if finish_calls:
+                finish_call = finish_calls[0]
+                if len(finish_calls) != 1 or business_calls:
+                    for invalid_finish in finish_calls:
+                        self.add_tool_result(
+                            invalid_finish.id,
+                            json.dumps({
+                                "error": (
+                                    "framework_commit_response must be the only tool call "
+                                    "in its turn and may be called exactly once"
+                                )
+                            }),
+                        )
+                else:
+                    try:
+                        finish_arguments = json.loads(finish_call.function.arguments or "{}")
+                    except json.JSONDecodeError:
+                        finish_arguments = {}
+                    response = str(finish_arguments.get("response") or "").strip()
+                    if response:
+                        self.add_tool_result(
+                            finish_call.id,
+                            json.dumps({"status": "committed"}),
+                        )
+                        await self.record_event("master_step_finished", {
+                            "step": "direct_execution",
+                            "message": "Master explicitly committed the completed response.",
+                        })
+                        return response
+                    self.add_tool_result(
+                        finish_call.id,
+                        json.dumps({"error": "response cannot be blank"}),
+                    )
+            current_input = (
+                "Use the tool results to complete the original request. Call another "
+                "business tool only if necessary; otherwise call "
+                "framework_commit_response with the complete final answer now."
+            )
+
+        final_data: dict[str, Any] = {}
+        if self.remaining_turns > 0 and self.remaining_seconds > 0:
+            self._phase = "forced_final_synthesis"
+            forced = await self.think(
+                "The direct-execution phase must end now. Synthesize the best complete "
+                "user-facing response from evidence already in context. Do not describe future "
+                "work. Return exactly one JSON object: "
+                '{"response":"complete answer","complete":true}. '
+                "If the task could not be completed, response must clearly state the exact gap."
+            )
+            final_data = extract_json_value(forced, dict) or {}
+        response = str(final_data.get("response") or "").strip()
+        if not response:
+            response = (
+                "The configured direct-execution budget ended before Master produced a "
+                "complete answer. Partial actions remain retained in the Run journal; no "
+                "progress note was misrepresented as a final response."
+            )
+        await self.record_event("master_step_finished", {
+            "step": "direct_execution",
+            "message": "Master reached the turn budget and performed a forced final synthesis.",
+        })
+        return response
+
+    async def _execute_master_tool_call(self, run_id: str, tool_call: Any) -> str:
+        name = str(tool_call.function.name)
+        try:
+            arguments = json.loads(tool_call.function.arguments or "{}")
+        except json.JSONDecodeError:
+            result = {"error": "Invalid JSON arguments"}
+            self.observe_action_result(f"tool {name}", result)
+            return json.dumps(result)
+        self._run_master_tool_call_counts[run_id] += 1
+        await self.record_event("tool_call", {
+            "name": name,
+            "arguments": arguments,
+            "owner": "master",
+        })
+        result = await self.tool_executor.execute(
+            name,
+            arguments,
+            ApprovalContext(
+                run_id=run_id,
+                agent_id=self.id,
+                task_id=self.task_id,
+                journal=self._run_journals.get(run_id),
+            ),
+        )
+        await self.record_event("tool_result", {
+            "name": name,
+            "result": str(result)[:4000],
+            "owner": "master",
+        })
+        self.observe_action_result(f"tool {name}", result)
+        return result if isinstance(result, str) else json.dumps(result, ensure_ascii=False)
 
     def _unique_role(
         self,
@@ -1046,28 +1582,24 @@ class MasterAgent(BaseAgent):
             self._run_locks[run_id] = asyncio.Lock()
             self._cold_run_ids.add(run_id)
 
-    async def _generate_skills_index(self) -> str:
-        if not self.tool_registry.get_all():
-            return ""
-        try:
-            return await self.skills_generator.generate(self.tool_registry)
-        except Exception:
-            logger.exception("Skills index generation failed; using deterministic fallback")
-            return self.skills_generator.generate_fallback(self.tool_registry)
-
     async def _activate_master_context(self, run_id: str, fresh: bool) -> None:
         self.journal = self._run_journals[run_id]
         self.run_id = run_id
         self.task_id = run_id
         self._sent_counts.clear()
+        self._running = True
+        self._phase = "planning" if fresh else "resuming"
         if fresh:
             self.context.clear_messages()
             self.context.clear_pinned()
+            self._runtime_observations.clear()
         elif run_id in self._master_context_states:
             self.context.restore_state(self._master_context_states[run_id])
         self.start_clock()
 
     async def _retain_master_state(self, run_id: str, final_response: str) -> None:
+        self._running = False
+        self._phase = "retained"
         self._master_context_states[run_id] = self.context.export_state()
         await self._run_journals[run_id].snapshot_agent(
             self,

@@ -6,12 +6,12 @@ from typing import Optional
 from urllib.parse import parse_qs, unquote, urlparse
 
 import httpx
-from bs4 import BeautifulSoup
 
 from .config import (
     SEMANTIC_SCHOLAR_BASE_URL,
     WEB_SEARCH_URL,
 )
+from .html_parser import SearchResultsParser
 
 
 _SEARCH_HEADERS = {
@@ -106,13 +106,12 @@ def search_web(
     except httpx.HTTPError as e:
         return json.dumps({"error": str(e), "query": query})
 
-    soup = BeautifulSoup(resp.text, "html.parser")
+    parser = SearchResultsParser()
+    parser.feed(resp.text[:2_000_000])
+    parser.close()
     results = []
-    for item in soup.select(".result"):
-        link = item.select_one(".result__a")
-        if link is None:
-            continue
-        url = _unwrap_result_url(str(link.get("href") or ""))
+    for item in parser.results:
+        url = _unwrap_result_url(item["url"])
         parsed = urlparse(url)
         if parsed.scheme not in {"http", "https"} or not parsed.hostname:
             continue
@@ -121,12 +120,11 @@ def search_web(
             continue
         if any(_domain_matches(hostname, domain) for domain in blocked):
             continue
-        snippet = item.select_one(".result__snippet")
         results.append(
             {
-                "title": link.get_text(" ", strip=True),
+                "title": item["title"],
                 "url": url,
-                "snippet": snippet.get_text(" ", strip=True) if snippet else "",
+                "snippet": item["snippet"],
                 "metadata": {"source": "duckduckgo"},
             }
         )

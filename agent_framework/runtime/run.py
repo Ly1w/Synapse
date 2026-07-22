@@ -42,6 +42,14 @@ class RunStatus(str, Enum):
     ARCHIVED = "archived"
 
 
+class RunCheckpoint(BaseModel):
+    checkpoint_id: str = Field(default_factory=lambda: f"checkpoint_{uuid.uuid4().hex[:10]}")
+    revision: int
+    response: str
+    reason: str = ""
+    created_at: float = Field(default_factory=time.time)
+
+
 class RunManifest(BaseModel):
     run_id: str
     user_request: str
@@ -50,6 +58,7 @@ class RunManifest(BaseModel):
     requirements: list[str] = Field(default_factory=list)
     agent_ids: list[str] = Field(default_factory=list)
     final_response: str = ""
+    checkpoints: list[RunCheckpoint] = Field(default_factory=list)
     created_at: float = Field(default_factory=time.time)
     updated_at: float = Field(default_factory=time.time)
     completed_at: float | None = None
@@ -142,6 +151,25 @@ class RunJournal:
             self.manifest.completed_at = time.time()
         await self._save_manifest()
 
+    async def commit_checkpoint(
+        self,
+        response: str,
+        reason: str = "",
+    ) -> RunCheckpoint:
+        """Persist one user-visible Master response without erasing prior turns."""
+        checkpoint = RunCheckpoint(
+            revision=self.manifest.revision,
+            response=response,
+            reason=reason,
+        )
+        self.manifest.checkpoints.append(checkpoint)
+        self.manifest.final_response = response
+        self.manifest.status = RunStatus.COMPLETED_RETAINED
+        self.manifest.updated_at = time.time()
+        self.manifest.completed_at = time.time()
+        await self._save_manifest()
+        return checkpoint
+
     async def add_requirement(self, text: str) -> int:
         self.manifest.revision += 1
         self.manifest.requirements.append(text)
@@ -199,7 +227,18 @@ class RunJournal:
             os.replace(temp_path, path)
 
     async def read_state(self) -> dict[str, Any]:
-        return self.manifest.model_dump(mode="json")
+        state = self.manifest.model_dump(mode="json")
+        if not state["checkpoints"] and state["final_response"]:
+            # Old Run manifests only retained the latest response. Expose it as one
+            # legacy checkpoint so upgraded UIs remain useful without rewriting data.
+            state["checkpoints"] = [{
+                "checkpoint_id": "legacy_latest",
+                "revision": state["revision"],
+                "response": state["final_response"],
+                "reason": "legacy_manifest",
+                "created_at": state["completed_at"] or state["updated_at"],
+            }]
+        return state
 
     async def read_events(
         self,

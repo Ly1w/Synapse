@@ -2,9 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import json
-import logging
 import os
-import sys
 from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import Any, AsyncIterator
@@ -22,46 +20,6 @@ from ..tools.mcp_provider import MCPServerConfig
 
 STATIC_DIR = Path(__file__).parent / "static"
 REPOSITORY_ROOT = Path(__file__).resolve().parents[2]
-logger = logging.getLogger(__name__)
-
-_mcp_health: dict[str, Any] = {
-    "status": "starting",
-    "error": "",
-}
-
-
-def _env_enabled(name: str, default: bool = True) -> bool:
-    value = os.environ.get(name)
-    if value is None:
-        return default
-    return value.strip().lower() not in {"0", "false", "no", "off", "disabled"}
-
-
-def _web_search_mcp_config() -> MCPServerConfig:
-    forwarded_names = (
-        "HTTP_PROXY", "HTTPS_PROXY", "NO_PROXY", "ALL_PROXY",
-        "http_proxy", "https_proxy", "no_proxy", "all_proxy",
-        "SSL_CERT_FILE", "REQUESTS_CA_BUNDLE",
-    )
-    forwarded = {
-        name: os.environ[name] for name in forwarded_names if name in os.environ
-    }
-    script = os.environ.get("SYNAPSE_WEB_SEARCH_MCP_SCRIPT")
-    args = (script,) if script else (
-        "-m", "agent_framework.tools.web_search_server"
-    )
-    return MCPServerConfig(
-        name="web-search",
-        command=os.environ.get("SYNAPSE_WEB_SEARCH_MCP_COMMAND", sys.executable),
-        args=args,
-        cwd=REPOSITORY_ROOT,
-        env=forwarded,
-        tool_allowlist=frozenset({"tool_search_web", "tool_fetch_webpage"}),
-        category="web_search",
-        call_timeout_seconds=float(
-            os.environ.get("SYNAPSE_WEB_SEARCH_TIMEOUT", "30")
-        ),
-    )
 
 
 class StartRunRequest(BaseModel):
@@ -70,6 +28,25 @@ class StartRunRequest(BaseModel):
 
 class SteerRunRequest(BaseModel):
     requirement: str = Field(min_length=1, max_length=50_000)
+
+
+class PermissionModeRequest(BaseModel):
+    mode: str
+
+
+class ApprovalDecisionRequest(BaseModel):
+    allow: bool
+
+
+class MCPServerRequest(BaseModel):
+    name: str = Field(min_length=1, max_length=64, pattern=r"^[A-Za-z0-9_.-]+$")
+    command: str = Field(min_length=1, max_length=10_000)
+    args: list[str] = Field(default_factory=list, max_length=100)
+    cwd: str | None = None
+    env: dict[str, str] = Field(default_factory=dict)
+    tool_allowlist: list[str] | None = None
+    connect_timeout_seconds: float = Field(default=20.0, gt=0, le=300)
+    call_timeout_seconds: float = Field(default=30.0, gt=0, le=600)
 
 
 def create_master_from_env() -> MasterAgent:
@@ -104,6 +81,8 @@ def create_master_from_env() -> MasterAgent:
         memory_root=os.environ.get("SYNAPSE_MEMORY_ROOT"),
         cache_dir=os.environ.get("SYNAPSE_CACHE_DIR"),
         run_root=os.environ.get("SYNAPSE_RUN_ROOT"),
+        workspace_root=os.environ.get("SYNAPSE_WORKSPACE", str(REPOSITORY_ROOT)),
+        permission_mode=os.environ.get("SYNAPSE_PERMISSION_MODE", "auto"),
     )
 
 
@@ -112,18 +91,6 @@ master = create_master_from_env()
 
 @asynccontextmanager
 async def lifespan(_: FastAPI):
-    if _env_enabled("SYNAPSE_WEB_SEARCH_MCP"):
-        try:
-            tools = await master.connect_mcp_server(_web_search_mcp_config())
-            _mcp_health.update({"status": "connected", "tools": tools, "error": ""})
-        except Exception as error:
-            if "MCP SDK is missing" in str(error):
-                logger.error("Web Search MCP unavailable: %s", error)
-            else:
-                logger.exception("Web Search MCP failed to start")
-            _mcp_health.update({"status": "degraded", "tools": [], "error": str(error)})
-    else:
-        _mcp_health.update({"status": "disabled", "tools": [], "error": ""})
     try:
         yield
     finally:
@@ -140,20 +107,93 @@ def _not_found(error: KeyError) -> HTTPException:
 @app.get("/api/health")
 async def health() -> dict[str, Any]:
     runtime = master.get_runtime_info()
+    tools = master.get_tool_info()
+    search_tools = [
+        name for name in ("WebSearch", "WebFetch") if name in tools["builtin"]
+    ]
     return {
         "status": "ok",
         "version": "0.2.0",
         **runtime,
-        "mcp": {
-            **_mcp_health,
-            "servers": master.get_mcp_status(),
+        "tools": tools,
+        "search": {
+            "status": "ready" if len(search_tools) == 2 else "degraded",
+            "tools": search_tools,
         },
+        "mcp": {"status": "user_configured", "servers": master.get_mcp_status()},
+        "permissions": master.get_permission_state(),
         "configured": bool(
             os.environ.get("SYNAPSE_API_KEY")
             or os.environ.get("OPENAI_API_KEY")
             or runtime["base_url"].startswith(("http://localhost", "http://127.0.0.1"))
         ),
     }
+
+
+@app.get("/api/permissions")
+async def get_permissions() -> dict[str, Any]:
+    return {
+        **master.get_permission_state(),
+        "pending": master.list_pending_approvals(),
+    }
+
+
+@app.put("/api/permissions")
+async def set_permissions(body: PermissionModeRequest) -> dict[str, Any]:
+    try:
+        return master.set_permission_mode(body.mode)
+    except ValueError as error:
+        raise HTTPException(status_code=422, detail=str(error)) from error
+
+
+@app.get("/api/approvals")
+async def list_approvals(run_id: str | None = None) -> dict[str, Any]:
+    return {"approvals": master.list_pending_approvals(run_id)}
+
+
+@app.post("/api/approvals/{approval_id}")
+async def resolve_approval(
+    approval_id: str,
+    body: ApprovalDecisionRequest,
+) -> dict[str, Any]:
+    try:
+        return await master.resolve_approval(approval_id, body.allow)
+    except KeyError as error:
+        raise _not_found(error) from error
+
+
+@app.get("/api/mcp/servers")
+async def list_mcp_servers() -> dict[str, Any]:
+    return {"servers": master.get_mcp_status()}
+
+
+@app.post("/api/mcp/servers", status_code=201)
+async def connect_mcp_server(body: MCPServerRequest) -> dict[str, Any]:
+    config = MCPServerConfig(
+        name=body.name,
+        command=body.command,
+        args=tuple(body.args),
+        cwd=body.cwd or REPOSITORY_ROOT,
+        env=body.env,
+        tool_allowlist=frozenset(body.tool_allowlist) if body.tool_allowlist else None,
+        category=f"mcp:{body.name}",
+        connect_timeout_seconds=body.connect_timeout_seconds,
+        call_timeout_seconds=body.call_timeout_seconds,
+    )
+    try:
+        tools = await master.connect_mcp_server(config)
+    except (RuntimeError, ValueError) as error:
+        raise HTTPException(status_code=422, detail=str(error)) from error
+    return {"name": body.name, "tools": tools, "status": "connected"}
+
+
+@app.delete("/api/mcp/servers/{name}")
+async def disconnect_mcp_server(name: str) -> dict[str, Any]:
+    try:
+        await master.disconnect_mcp_server(name)
+    except KeyError as error:
+        raise _not_found(error) from error
+    return {"name": name, "status": "disconnected"}
 
 
 @app.get("/api/runs")

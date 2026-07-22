@@ -21,7 +21,6 @@ class AgentBudget(BaseModel):
     """Hard limits that keep an agent from expanding or chatting forever."""
 
     max_turns: int = Field(default=12, ge=1, le=100)
-    max_tool_calls: int = Field(default=12, ge=0, le=200)
     max_peer_messages: int = Field(default=2, ge=0, le=20)
     max_discoveries: int = Field(default=1, ge=0, le=10)
     max_children: int = Field(default=4, ge=0, le=20)
@@ -85,4 +84,3 @@ class AgentOutcome(BaseModel):
         # Keep the legacy key so older observers still have useful text.
         data["text"] = self.summary
         return data
-

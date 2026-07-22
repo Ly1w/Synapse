@@ -11,8 +11,10 @@ from ..communication.router import AgentRole, Router
 from ..context.manager import ContextManager
 from ..llm.client import LLMClient
 from ..memory.memory_store import MemoryStore
-from ..skills.reader import SkillsReader
+from ..skills import SkillCatalog
+from ..system_prompts import build_head_system_prompt
 from ..tools.registry import ToolRegistry
+from ..tools.permissions import PermissionManager
 from .base_agent import BaseAgent
 from .contracts import AgentBudget, AgentOutcome, OutcomeStatus, TaskContract
 from .node_agent import NodeAgent
@@ -20,26 +22,6 @@ from .parsing import extract_json_value
 from .registry import AgentRegistry
 
 logger = logging.getLogger(__name__)
-
-
-HEAD_SYSTEM_PROMPT = """\
-You are an accountable Head Agent in a hierarchical multi-agent system.
-
-Your task contract:
-{contract}
-
-Peer Heads and their responsibilities:
-{peer_roster}
-
-Your responsibilities:
-1. Develop your own understanding of the problem; do not outsource all reasoning.
-2. Create Nodes only for focused execution that benefits from specialization or parallelism.
-3. Keep ownership of scope, integration, conflict resolution, and acceptance checks.
-4. Treat Node discoveries as observations. You decide whether to absorb, delegate,
-   coordinate with a peer Head, or submit one bounded proposal to Master.
-5. Review Node outcomes and request bounded follow-up work when evidence is inadequate.
-6. Return partial/blocked/failed honestly; never wait forever for a perfect result.
-"""
 
 
 PREPARATION_PROMPT = """\
@@ -106,7 +88,7 @@ class HeadAgent(BaseAgent):
         channel: Channel,
         tool_registry: ToolRegistry,
         agent_registry: AgentRegistry,
-        skills_reader: SkillsReader | None = None,
+        skill_catalog: SkillCatalog | None = None,
         peer_roster: str = "",
         memory_store: MemoryStore | None = None,
         context_manager: ContextManager | None = None,
@@ -117,19 +99,20 @@ class HeadAgent(BaseAgent):
         run_id: str = "",
         journal: Any | None = None,
         node_llm_client: LLMClient | None = None,
+        permission_manager: PermissionManager | None = None,
     ):
         self.contract = contract or TaskContract(role=role, goal=task, scope=task)
         self.task = self.contract.goal
         self.master_id = master_id
         self.tool_registry = tool_registry
         self.agent_registry = agent_registry
-        self.skills_reader = skills_reader
+        self.skill_catalog = skill_catalog
         self.node_llm_client = node_llm_client or llm_client
+        self.permission_manager = permission_manager
         self.peer_roster_text = peer_roster or "No peers yet."
         self.memory_store = memory_store
         self.child_budget = child_budget or AgentBudget(
             max_turns=10,
-            max_tool_calls=10,
             max_peer_messages=2,
             max_discoveries=1,
             max_children=0,
@@ -151,16 +134,19 @@ class HeadAgent(BaseAgent):
 
         actual_budget = budget or AgentBudget(
             max_turns=max_turns,
-            max_tool_calls=4,
             max_peer_messages=4,
             max_discoveries=2,
             max_children=4,
             max_revision_rounds=1,
             timeout_seconds=600,
         )
-        system_prompt = HEAD_SYSTEM_PROMPT.format(
-            contract=self.contract.to_prompt(),
-            peer_roster=self.peer_roster_text,
+        system_prompt = build_head_system_prompt(
+            self.contract.to_prompt(),
+            self.peer_roster_text,
+            actual_budget,
+            self.child_budget,
+            self.permission_manager.get_state() if self.permission_manager else None,
+            self._skill_inventory(),
         )
         super().__init__(
             agent_id=agent_id,
@@ -178,14 +164,90 @@ class HeadAgent(BaseAgent):
 
     def update_peer_roster(self, peer_roster: str) -> None:
         self.peer_roster_text = peer_roster or "No peers yet."
-        self.system_prompt = HEAD_SYSTEM_PROMPT.format(
-            contract=self.contract.to_prompt(),
-            peer_roster=self.peer_roster_text,
+        self.refresh_system_prompt()
+
+    def _skill_inventory(self) -> str:
+        if self.skill_catalog is None:
+            return "No model-invocable Skills are currently installed."
+        return self.skill_catalog.model_inventory()
+
+    def refresh_system_prompt(self) -> None:
+        self.system_prompt = build_head_system_prompt(
+            self.contract.to_prompt(),
+            self.peer_roster_text,
+            self.budget,
+            self.child_budget,
+            self.permission_manager.get_state() if self.permission_manager else None,
+            self._skill_inventory(),
         )
         self.context.set_system_prompt(self.system_prompt)
+        for node in self._node_agents.values():
+            node.refresh_system_prompt()
+
+    def runtime_state(self) -> dict[str, Any]:
+        state = super().runtime_state()
+        peer_messages = (
+            self.sent_count(MessageType.PEER_REQUEST)
+            + self.sent_count(MessageType.PEER_RESPONSE)
+        )
+        settled_phases = sum(len(items) for items in self._node_outcomes.values())
+        state.update({
+            "role_position": {
+                "level": "Head",
+                "parent_master_id": self.master_id,
+                "responsibility": "Own, validate, and integrate exactly this contract",
+                "goal": self.contract.goal,
+                "scope": self.contract.scope or self.contract.goal,
+                "deliverable": self.contract.deliverable,
+                "may_create": "Node only",
+                "must_not": [
+                    "create Heads or redefine the global plan",
+                    "delegate integration or acceptance checking",
+                    "answer the end user",
+                ],
+            },
+            "current_topology": {
+                "peer_head_ids": self.router.get_peers(self.id),
+                "node_ids": list(self._node_agents),
+                "active_node_ids": list(self._node_tasks),
+                "settled_node_phases": settled_phases,
+                "inbox_pending": self.channel.pending,
+            },
+            "remaining_communication_and_expansion": {
+                "node_slots_used": len(self._node_agents),
+                "node_slots_max": self.budget.max_children,
+                "node_slots_remaining": max(
+                    0, self.budget.max_children - len(self._node_agents)
+                ),
+                "peer_messages_used": peer_messages,
+                "peer_messages_max": self.budget.max_peer_messages,
+                "peer_messages_remaining": max(
+                    0, self.budget.max_peer_messages - peer_messages
+                ),
+                "discoveries_triaged": self._discoveries_handled,
+                "discoveries_max": self.budget.max_discoveries,
+                "discoveries_remaining": max(
+                    0, self.budget.max_discoveries - self._discoveries_handled
+                ),
+                "revision_rounds_used": self._revision_rounds,
+                "revision_rounds_max": self.budget.max_revision_rounds,
+                "revision_rounds_remaining": max(
+                    0, self.budget.max_revision_rounds - self._revision_rounds
+                ),
+            },
+            "steering_and_control": {
+                "applied_user_revisions": sorted(self._applied_revisions),
+                "cancel_requested": self._cancel_requested,
+            },
+            "permission": (
+                self.permission_manager.get_state() if self.permission_manager else None
+            ),
+        })
+        return state
 
     async def run(self) -> AgentOutcome:
         self._running = True
+        self._phase = "preparation"
         self.start_clock()
         await self.record_event("agent_phase_started", {"contract": self.contract.model_dump(mode="json")})
         logger.info("HeadAgent %s starting: %s", self.id, self.task[:100])
@@ -212,6 +274,7 @@ class HeadAgent(BaseAgent):
         finally:
             await self._cancel_active_nodes("Head is stopping")
             self._running = False
+            self._phase = "retained"
 
         await self._finish_phase(outcome)
         return outcome
@@ -223,6 +286,7 @@ class HeadAgent(BaseAgent):
     ) -> AgentOutcome:
         """Resume the same Head and its retained Nodes for a user-approved revision."""
         self._running = True
+        self._phase = "applying_user_revision"
         self.start_clock()
         self._cancel_requested = False
         self._sent_counts.clear()
@@ -250,6 +314,7 @@ class HeadAgent(BaseAgent):
         finally:
             await self._cancel_active_nodes("Head revision is stopping")
             self._running = False
+            self._phase = "retained"
 
         await self._finish_phase(outcome)
         return outcome
@@ -264,14 +329,26 @@ class HeadAgent(BaseAgent):
         self._memory_loaded = True
 
     async def _prepare_work(self) -> dict[str, Any]:
+        await self.record_event("agent_step_started", {
+            "step": "head_preparation",
+            "message": "Head is analyzing its contract and deciding whether Nodes are useful.",
+        })
         raw = await self.think(PREPARATION_PROMPT.format(max_nodes=self.budget.max_children))
         data = extract_json_value(raw, dict)
         if not data:
+            await self.record_event("agent_step_finished", {
+                "step": "head_preparation",
+                "node_count": 0,
+            })
             return {"head_analysis": raw, "node_assignments": []}
         assignments = data.get("node_assignments", [])
         if not isinstance(assignments, list):
             assignments = []
         data["node_assignments"] = assignments[:self.budget.max_children]
+        await self.record_event("agent_step_finished", {
+            "step": "head_preparation",
+            "node_count": len(data["node_assignments"]),
+        })
         return data
 
     async def _launch_assignments(self, assignments: list[dict[str, Any]]) -> None:
@@ -296,7 +373,11 @@ class HeadAgent(BaseAgent):
             scope=str(spec.get("scope") or goal),
             deliverable=str(spec.get("deliverable") or "Focused task result"),
             acceptance_criteria=[str(item) for item in spec.get("acceptance_criteria", [])],
-            context={"parent_contract": self.contract.task_id},
+            context={
+                "parent_contract": self.contract.task_id,
+                "parent_goal": self.contract.goal,
+                "user_request": self.contract.context.get("user_request", ""),
+            },
         )
         node_id = AgentRegistry.generate_id("node")
         channel = self.router.register(
@@ -314,11 +395,12 @@ class HeadAgent(BaseAgent):
             router=self.router,
             channel=channel,
             tool_registry=self.tool_registry,
-            skills_reader=self.skills_reader,
+            skill_catalog=self.skill_catalog,
             contract=contract,
             budget=self.child_budget.model_copy(deep=True),
             run_id=self.run_id,
             journal=self.journal,
+            permission_manager=self.permission_manager,
         )
         self.agent_registry.register(node, {
             "role": role,
@@ -388,6 +470,7 @@ class HeadAgent(BaseAgent):
         return outcome
 
     async def _monitor_nodes(self) -> None:
+        self._phase = "monitoring_nodes"
         while self._node_tasks and not self._cancel_requested and self.remaining_seconds > 0:
             message = await self.receive_message(timeout=min(0.25, self.remaining_seconds))
             if message:
@@ -513,6 +596,7 @@ class HeadAgent(BaseAgent):
         allow_resume: bool = False,
         revision: int | list[int] | None = None,
     ) -> None:
+        self._phase = "applying_guidance"
         self.contract.context[f"guidance_{len(self.contract.context) + 1}"] = guidance
         roster = "\n".join(f"- {node_id}: {desc}" for node_id, desc in self._node_descriptions.items())
         raw = await self.think(
@@ -599,6 +683,7 @@ class HeadAgent(BaseAgent):
         return outcome
 
     async def _synthesize_results(self) -> tuple[AgentOutcome, list[dict[str, Any]]]:
+        self._phase = "synthesis"
         serialized = []
         for node_id, outcomes in self._node_outcomes.items():
             for phase, outcome in enumerate(outcomes, start=1):
@@ -607,11 +692,19 @@ class HeadAgent(BaseAgent):
                     "phase": phase,
                     **outcome.model_dump(mode="json"),
                 })
+        await self.record_event("agent_step_started", {
+            "step": "head_synthesis",
+            "message": "Head is integrating evidence and checking acceptance criteria.",
+        })
         raw = await self.think(SYNTHESIS_PROMPT.format(
             contract=self.contract.to_prompt(),
             head_analysis=self._head_analysis or "No separate initial analysis.",
             node_outcomes=serialized or "No Node delegation was needed.",
         ))
+        await self.record_event("agent_step_finished", {
+            "step": "head_synthesis",
+            "message": "Head finished its integrated outcome.",
+        })
         data = extract_json_value(raw, dict) or {}
         status_text = str(data.get("status", "partial" if not data else "completed"))
         try:

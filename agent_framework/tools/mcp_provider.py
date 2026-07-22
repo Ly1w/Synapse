@@ -1,8 +1,10 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
 import logging
+import os
 import re
 from dataclasses import dataclass, field
 from datetime import timedelta
@@ -15,6 +17,7 @@ logger = logging.getLogger(__name__)
 
 _TOOL_NAME_PATTERN = re.compile(r"^[A-Za-z0-9_-]{1,64}$")
 _STOP = object()
+_SENSITIVE_ENV_PARTS = ("api_key", "apikey", "authorization", "password", "secret", "token")
 
 
 @dataclass(frozen=True, slots=True)
@@ -83,12 +86,14 @@ class MCPToolProvider:
                 )
 
             planned: list[tuple[Any, str]] = []
+            planned_names: set[str] = set()
             for tool in selected:
-                exposed_name = f"{self.config.tool_prefix}{tool.name}"
+                exposed_name = self._exposed_name(str(tool.name))
                 if not _TOOL_NAME_PATTERN.fullmatch(exposed_name):
                     raise ValueError(f"Invalid exposed MCP tool name: {exposed_name}")
-                if registry.get(exposed_name) is not None:
+                if exposed_name in planned_names or registry.get(exposed_name) is not None:
                     raise ValueError(f"Tool name already registered: {exposed_name}")
+                planned_names.add(exposed_name)
                 planned.append((tool, exposed_name))
 
             for tool, exposed_name in planned:
@@ -99,6 +104,8 @@ class MCPToolProvider:
                     parameters=dict(tool.inputSchema or {"type": "object", "properties": {}}),
                     category=self.config.category,
                     callable_fn=self._make_callable(remote_name),
+                    source=f"mcp:{self.config.name}",
+                    permission_scope="mcp",
                 )
                 self._registered_names[exposed_name] = remote_name
             logger.info(
@@ -168,6 +175,19 @@ class MCPToolProvider:
             )
         return [tool for tool in tools if str(tool.name) in allowed]
 
+    def _exposed_name(self, remote_name: str) -> str:
+        normalized = re.sub(r"[^A-Za-z0-9_-]", "_", remote_name).strip("_") or "tool"
+        digest = hashlib.sha256(remote_name.encode("utf-8")).hexdigest()[:8]
+        if normalized != remote_name:
+            normalized = f"{normalized}_{digest}"
+        prefix = self.config.tool_prefix
+        available = 64 - len(prefix)
+        if available < 10:
+            raise ValueError(f"MCP tool prefix is too long: {prefix}")
+        if len(normalized) > available:
+            normalized = f"{normalized[:available - 9]}_{digest}"
+        return f"{prefix}{normalized}"
+
     def _make_callable(self, remote_name: str):
         async def invoke(**arguments: Any) -> Any:
             return await self.call_tool(remote_name, arguments)
@@ -190,7 +210,13 @@ class MCPToolProvider:
                 command=self.config.command,
                 args=list(self.config.args),
                 cwd=self.config.cwd,
-                env=self.config.env or None,
+                env={
+                    **{
+                        key: value for key, value in os.environ.items()
+                        if not any(part in key.lower() for part in _SENSITIVE_ENV_PARTS)
+                    },
+                    **self.config.env,
+                },
             )
             async with stdio_client(params) as (read_stream, write_stream):
                 async with ClientSession(read_stream, write_stream) as session:

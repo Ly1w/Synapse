@@ -29,6 +29,10 @@
           <span id="connectionLabel">Connecting</span>
         </div>
         <div class="model-chip search-chip" id="searchChip">SEARCH —</div>
+        <button class="model-chip permission-chip" id="settingsButton" type="button">
+          <span id="permissionLabel">PERMISSION —</span>
+          <span class="approval-count hidden" id="approvalCount">0</span>
+        </button>
         <div class="model-chip" id="modelChip">MODEL —</div>
         <button class="icon-button mobile-runs-button" id="mobileRunsButton" aria-label="Show runs">
           <span></span><span></span><span></span>
@@ -143,8 +147,8 @@
           <section class="checkpoint-section">
             <div class="section-heading-row">
               <div>
-                <div class="section-kicker">MASTER CHECKPOINT</div>
-                <h3>Current synthesis</h3>
+                <div class="section-kicker">MASTER CHECKPOINTS</div>
+                <h3>Response history</h3>
               </div>
               <button class="copy-button" id="copyResponseButton" title="Copy checkpoint">
                 <svg viewBox="0 0 20 20" aria-hidden="true"><path d="M7 6V3h10v10h-3M3 7h10v10H3z" /></svg>
@@ -157,6 +161,17 @@
                 Master has not committed a checkpoint yet.
               </div>
             </div>
+          </section>
+
+          <section class="guidance-section hidden" id="guidanceSection" aria-live="polite">
+            <div class="section-heading-row guidance-heading">
+              <div>
+                <div class="section-kicker">YOUR STEERING</div>
+                <h3>Requirement updates</h3>
+              </div>
+              <small>Visible immediately · retained with this Run</small>
+            </div>
+            <div class="guidance-thread" id="guidanceThread"></div>
           </section>
 
           <section class="steer-section" id="steerSection">
@@ -231,6 +246,73 @@
           </button>
         </div>
         <div class="requirements-list" id="requirementsList"></div>
+      </div>
+    </div>
+
+    <div class="modal-backdrop hidden" id="settingsModal">
+      <div class="modal settings-modal" role="dialog" aria-modal="true" aria-labelledby="settingsTitle">
+        <div class="modal-header">
+          <div>
+            <div class="section-kicker">TOOLS &amp; ACCESS</div>
+            <h2 id="settingsTitle">Runtime permissions</h2>
+          </div>
+          <button class="icon-button" id="settingsClose" aria-label="Close">
+            <svg viewBox="0 0 20 20" aria-hidden="true"><path d="m4 4 12 12M16 4 4 16" /></svg>
+          </button>
+        </div>
+
+        <section class="settings-section">
+          <div class="settings-section-title">
+            <span>PERMISSION MODE</span>
+            <code id="workspaceRoot">—</code>
+          </div>
+          <div class="permission-options" id="permissionOptions">
+            <button type="button" class="permission-option" data-permission-mode="ask">
+              <span class="permission-icon">✋</span>
+              <span><strong>Ask for approval</strong><small>Ask before writes, effectful shell commands, internet access, and MCP calls.</small></span>
+              <i></i>
+            </button>
+            <button type="button" class="permission-option" data-permission-mode="auto">
+              <span class="permission-icon">◈</span>
+              <span><strong>Approve for me</strong><small>Only ask for actions detected as potentially unsafe or externally scoped.</small></span>
+              <i></i>
+            </button>
+            <button type="button" class="permission-option full-option" data-permission-mode="full">
+              <span class="permission-icon">⚠</span>
+              <span><strong>Full access</strong><small>Do not approval-gate filesystem, shell, internet, or MCP tool calls.</small></span>
+              <i></i>
+            </button>
+          </div>
+        </section>
+
+        <section class="settings-section">
+          <div class="settings-section-title">
+            <span>PENDING APPROVALS</span>
+            <span class="count-badge" id="pendingApprovalCount">0</span>
+          </div>
+          <div class="approval-list" id="approvalList">
+            <div class="settings-empty">No tool calls are waiting for approval.</div>
+          </div>
+        </section>
+
+        <section class="settings-section">
+          <div class="settings-section-title">
+            <span>USER MCP SERVERS</span>
+            <small>Optional extensions · built-in search does not use MCP</small>
+          </div>
+          <div class="mcp-server-list" id="mcpServerList">
+            <div class="settings-empty">No user MCP servers connected.</div>
+          </div>
+          <form class="mcp-form" id="mcpForm">
+            <div class="mcp-form-grid">
+              <label><span>Name</span><input id="mcpName" maxlength="64" placeholder="github" required /></label>
+              <label><span>Command</span><input id="mcpCommand" placeholder="npx" required /></label>
+            </div>
+            <label><span>Arguments as JSON array</span><input id="mcpArgs" placeholder='["-y", "@server/package"]' /></label>
+            <label><span>Tool allowlist (comma separated, optional)</span><input id="mcpAllowlist" placeholder="search,retrieve" /></label>
+            <button class="secondary-button" id="mcpConnectButton" type="submit">Connect MCP server</button>
+          </form>
+        </section>
       </div>
     </div>
 

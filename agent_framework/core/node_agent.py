@@ -10,36 +10,16 @@ from ..communication.message import MessageType
 from ..communication.router import Router
 from ..context.manager import ContextManager
 from ..llm.client import LLMClient
-from ..skills.reader import SkillsReader
+from ..skills import SkillCatalog
+from ..system_prompts import build_node_system_prompt
 from ..tools.executor import ToolExecutor
+from ..tools.permissions import ApprovalContext, PermissionManager
 from ..tools.registry import ToolRegistry
 from .base_agent import BaseAgent
 from .contracts import AgentBudget, AgentOutcome, OutcomeStatus, TaskContract
 from .parsing import extract_json_value
 
 logger = logging.getLogger(__name__)
-
-
-NODE_SYSTEM_PROMPT = """\
-You are a bounded Node Agent in a hierarchical multi-agent system.
-
-Your task contract:
-{contract}
-
-Sibling Nodes you may contact:
-{sibling_roster}
-
-Rules:
-1. Work only inside the contract. You cannot create agents or change the plan.
-2. Use business tools when they materially advance the task.
-3. A newly noticed issue is a DISCOVERY, not a request to create a new Head.
-4. Ask a sibling only a concrete question that unblocks your contract. Never wait idly
-   for a reply; continue with the best available information.
-5. Peer communication and discoveries have hard budgets enforced by the runtime.
-6. When you have a result, stop calling tools and return one JSON object:
-   {{"status":"completed|partial|blocked", "summary":"...", \
-"evidence":["..."], "unresolved":["..."]}}
-"""
 
 
 def _control_tool_schemas(has_siblings: bool) -> list[dict[str, Any]]:
@@ -113,7 +93,7 @@ class NodeAgent(BaseAgent):
         router: Router,
         channel: Channel,
         tool_registry: ToolRegistry,
-        skills_reader: SkillsReader | None = None,
+        skill_catalog: SkillCatalog | None = None,
         context_manager: ContextManager | None = None,
         max_turns: int = 12,
         contract: TaskContract | None = None,
@@ -121,31 +101,35 @@ class NodeAgent(BaseAgent):
         sibling_roster: dict[str, str] | None = None,
         run_id: str = "",
         journal: Any | None = None,
+        permission_manager: PermissionManager | None = None,
     ):
         self.contract = contract or TaskContract(role=role, goal=task, scope=task)
         self.task = self.contract.goal
         self.head_id = head_id
         self.tool_registry = tool_registry
-        self.tool_executor = ToolExecutor(tool_registry)
-        self.skills_reader = skills_reader
+        self.tool_executor = ToolExecutor(tool_registry, permission_manager)
+        self.permission_manager = permission_manager
+        self.skill_catalog = skill_catalog
         self.sibling_roster = sibling_roster or {}
         self._pending_peer_requests: dict[str, str] = {}
         self._cancel_requested = False
-        self._tool_calls_used = 0
+        self._tool_call_count = 0
         self._last_text = ""
 
         actual_budget = budget or AgentBudget(
             max_turns=max_turns,
-            max_tool_calls=12,
             max_peer_messages=2,
             max_discoveries=1,
             max_children=0,
             max_revision_rounds=0,
             timeout_seconds=300,
         )
-        system_prompt = NODE_SYSTEM_PROMPT.format(
-            contract=self.contract.to_prompt(),
-            sibling_roster=self._format_sibling_roster(),
+        system_prompt = build_node_system_prompt(
+            self.contract.to_prompt(),
+            self._format_sibling_roster(),
+            actual_budget,
+            self.permission_manager.get_state() if self.permission_manager else None,
+            self._skill_inventory(),
         )
         super().__init__(
             agent_id=agent_id,
@@ -163,9 +147,20 @@ class NodeAgent(BaseAgent):
 
     def set_sibling_roster(self, roster: dict[str, str]) -> None:
         self.sibling_roster = dict(roster)
-        self.system_prompt = NODE_SYSTEM_PROMPT.format(
-            contract=self.contract.to_prompt(),
-            sibling_roster=self._format_sibling_roster(),
+        self.refresh_system_prompt()
+
+    def _skill_inventory(self) -> str:
+        if self.skill_catalog is None:
+            return "No model-invocable Skills are currently installed."
+        return self.skill_catalog.model_inventory()
+
+    def refresh_system_prompt(self) -> None:
+        self.system_prompt = build_node_system_prompt(
+            self.contract.to_prompt(),
+            self._format_sibling_roster(),
+            self.budget,
+            self.permission_manager.get_state() if self.permission_manager else None,
+            self._skill_inventory(),
         )
         self.context.set_system_prompt(self.system_prompt)
 
@@ -177,8 +172,65 @@ class NodeAgent(BaseAgent):
             for agent_id, description in self.sibling_roster.items()
         )
 
+    def runtime_state(self) -> dict[str, Any]:
+        state = super().runtime_state()
+        peer_messages = (
+            self.sent_count(MessageType.PEER_REQUEST)
+            + self.sent_count(MessageType.PEER_RESPONSE)
+        )
+        discoveries = self.sent_count(MessageType.DISCOVERY)
+        state.update({
+            "role_position": {
+                "level": "Node",
+                "parent_head_id": self.head_id,
+                "responsibility": "Execute only this focused contract and report to Head",
+                "goal": self.contract.goal,
+                "scope": self.contract.scope or self.contract.goal,
+                "deliverable": self.contract.deliverable,
+                "may_create_agents": False,
+                "may_contact_master": False,
+                "must_not": [
+                    "broaden the contract or reorganize the hierarchy",
+                    "wait for a sibling response",
+                    "answer the end user",
+                ],
+            },
+            "current_topology": {
+                "sibling_node_ids": list(self.sibling_roster),
+                "pending_sibling_request_ids": list(self._pending_peer_requests),
+                "inbox_pending": self.channel.pending,
+            },
+            "current_execution": {
+                "business_tool_calls_observed": self._tool_call_count,
+                "business_tool_call_limit": None,
+                "business_tool_stop_condition": (
+                    "phase timeout, per-tool timeout, cancellation, or convergence"
+                ),
+            },
+            "remaining_communication": {
+                "peer_messages_used": peer_messages,
+                "peer_messages_max": self.budget.max_peer_messages,
+                "peer_messages_remaining": max(
+                    0, self.budget.max_peer_messages - peer_messages
+                ),
+                "discoveries_sent": discoveries,
+                "discoveries_max": self.budget.max_discoveries,
+                "discoveries_remaining": max(
+                    0, self.budget.max_discoveries - discoveries
+                ),
+            },
+            "steering_and_control": {
+                "cancel_requested": self._cancel_requested,
+            },
+            "permission": (
+                self.permission_manager.get_state() if self.permission_manager else None
+            ),
+        })
+        return state
+
     async def run(self) -> AgentOutcome:
         self._running = True
+        self._phase = "contract_execution"
         self.start_clock()
         logger.info("NodeAgent %s starting task: %s", self.id, self.task[:100])
         outcome: AgentOutcome | None = None
@@ -241,6 +293,7 @@ class NodeAgent(BaseAgent):
             )
 
         self._running = False
+        self._phase = "retained"
         outcome.metadata.update(self._usage_metadata())
         await self.send_message(
             self.head_id,
@@ -265,7 +318,7 @@ class NodeAgent(BaseAgent):
         })
         self.contract.context[f"follow_up_{uuid.uuid4().hex[:6]}"] = guidance
         self._sent_counts.clear()
-        self._tool_calls_used = 0
+        self._tool_call_count = 0
         self._cancel_requested = False
         await self.record_event("agent_resumed", {"guidance": guidance})
         return await self.run()
@@ -275,7 +328,9 @@ class NodeAgent(BaseAgent):
         try:
             arguments = json.loads(tool_call.function.arguments or "{}")
         except json.JSONDecodeError:
-            return json.dumps({"error": "Invalid JSON arguments"})
+            result = {"error": "Invalid JSON arguments"}
+            self.observe_action_result(f"tool {name}", result)
+            return json.dumps(result)
 
         if name.startswith("framework_"):
             result = await self._execute_control_tool(name, arguments)
@@ -284,17 +339,26 @@ class NodeAgent(BaseAgent):
                 "arguments": arguments,
                 "result": result,
             })
+            self.observe_action_result(f"control {name}", result)
             return json.dumps(result, ensure_ascii=False)
 
-        if self._tool_calls_used >= self.budget.max_tool_calls:
-            return json.dumps({"error": "Business tool-call budget exhausted"})
-        self._tool_calls_used += 1
+        self._tool_call_count += 1
         await self.record_event("tool_call", {"name": name, "arguments": arguments})
-        result = await self.tool_executor.execute(name, arguments)
+        result = await self.tool_executor.execute(
+            name,
+            arguments,
+            ApprovalContext(
+                run_id=self.run_id,
+                agent_id=self.id,
+                task_id=self.task_id,
+                journal=self.journal,
+            ),
+        )
         await self.record_event("tool_result", {
             "name": name,
             "result": str(result)[:4000],
         })
+        self.observe_action_result(f"tool {name}", result)
         return result if isinstance(result, str) else json.dumps(result, ensure_ascii=False)
 
     async def _execute_control_tool(self, name: str, arguments: dict[str, Any]) -> dict[str, Any]:
@@ -353,11 +417,6 @@ class NodeAgent(BaseAgent):
         return {"error": f"Unknown framework tool: {name}"}
 
     async def _load_tools(self) -> list[dict[str, Any]]:
-        if self.skills_reader:
-            try:
-                return await self.skills_reader.find_tools(self.contract.goal)
-            except Exception as exc:
-                logger.warning("Skills reader failed: %s, using all tools", exc)
         return self.tool_registry.get_openai_schemas()
 
     async def _process_incoming_messages(self) -> None:
@@ -408,7 +467,7 @@ class NodeAgent(BaseAgent):
 
     def _usage_metadata(self) -> dict[str, Any]:
         return {
-            "tool_calls": self._tool_calls_used,
+            "tool_calls": self._tool_call_count,
             "peer_messages": (
                 self.sent_count(MessageType.PEER_REQUEST)
                 + self.sent_count(MessageType.PEER_RESPONSE)

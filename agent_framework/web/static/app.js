@@ -3,6 +3,9 @@ const ui = {
   connectionLabel: document.querySelector("#connectionLabel"),
   modelChip: document.querySelector("#modelChip"),
   searchChip: document.querySelector("#searchChip"),
+  settingsButton: document.querySelector("#settingsButton"),
+  permissionLabel: document.querySelector("#permissionLabel"),
+  approvalCount: document.querySelector("#approvalCount"),
   newRunForm: document.querySelector("#newRunForm"),
   requestInput: document.querySelector("#requestInput"),
   launchButton: document.querySelector("#launchButton"),
@@ -20,6 +23,8 @@ const ui = {
   topologyCanvas: document.querySelector("#topologyCanvas"),
   checkpointBody: document.querySelector("#checkpointBody"),
   copyResponseButton: document.querySelector("#copyResponseButton"),
+  guidanceSection: document.querySelector("#guidanceSection"),
+  guidanceThread: document.querySelector("#guidanceThread"),
   steerForm: document.querySelector("#steerForm"),
   steerInput: document.querySelector("#steerInput"),
   steerButton: document.querySelector("#steerButton"),
@@ -38,6 +43,19 @@ const ui = {
   requirementsModal: document.querySelector("#requirementsModal"),
   requirementsClose: document.querySelector("#requirementsClose"),
   requirementsList: document.querySelector("#requirementsList"),
+  settingsModal: document.querySelector("#settingsModal"),
+  settingsClose: document.querySelector("#settingsClose"),
+  permissionOptions: document.querySelector("#permissionOptions"),
+  workspaceRoot: document.querySelector("#workspaceRoot"),
+  pendingApprovalCount: document.querySelector("#pendingApprovalCount"),
+  approvalList: document.querySelector("#approvalList"),
+  mcpServerList: document.querySelector("#mcpServerList"),
+  mcpForm: document.querySelector("#mcpForm"),
+  mcpName: document.querySelector("#mcpName"),
+  mcpCommand: document.querySelector("#mcpCommand"),
+  mcpArgs: document.querySelector("#mcpArgs"),
+  mcpAllowlist: document.querySelector("#mcpAllowlist"),
+  mcpConnectButton: document.querySelector("#mcpConnectButton"),
   toastRegion: document.querySelector("#toastRegion"),
   mobileRunsButton: document.querySelector("#mobileRunsButton"),
   runsPanel: document.querySelector("#runsPanel"),
@@ -54,6 +72,10 @@ const state = {
   eventFilter: "all",
   stateRefreshTimer: null,
   listRefreshTimer: null,
+  permissions: null,
+  approvals: [],
+  mcpServers: [],
+  pendingSteers: new Map(),
 };
 
 const STATUS_LABELS = {
@@ -155,9 +177,12 @@ async function loadHealth() {
     ui.connectionBadge.classList.toggle("offline", !health.configured);
     ui.connectionLabel.textContent = health.configured ? "Runtime ready" : "Needs API config";
     ui.modelChip.textContent = `MODEL ${health.planner_model}`;
-    const searchStatus = health.mcp?.status || "degraded";
+    const searchStatus = health.search?.status || "degraded";
     ui.searchChip.className = `model-chip search-chip ${searchStatus}`;
-    ui.searchChip.textContent = searchStatus === "connected" ? "SEARCH READY" : `SEARCH ${searchStatus}`;
+    ui.searchChip.textContent = searchStatus === "ready" ? "SEARCH BUILT-IN" : `SEARCH ${searchStatus}`;
+    state.permissions = health.permissions || null;
+    state.mcpServers = health.mcp?.servers || [];
+    renderSettingsState();
   } catch (error) {
     ui.connectionBadge.classList.add("offline");
     ui.connectionLabel.textContent = "Runtime offline";
@@ -165,6 +190,135 @@ async function loadHealth() {
     ui.searchChip.className = "model-chip search-chip degraded";
     ui.searchChip.textContent = "SEARCH OFFLINE";
   }
+}
+
+async function loadSettingsState() {
+  const [permissions, mcp] = await Promise.all([
+    api("/api/permissions"),
+    api("/api/mcp/servers"),
+  ]);
+  state.permissions = permissions;
+  state.approvals = permissions.pending || [];
+  state.mcpServers = mcp.servers || [];
+  renderSettingsState();
+}
+
+function renderSettingsState() {
+  const mode = state.permissions?.mode || "auto";
+  ui.permissionLabel.textContent = `PERMISSION ${mode.toUpperCase()}`;
+  ui.workspaceRoot.textContent = state.permissions?.workspace_root || "—";
+  ui.permissionOptions.querySelectorAll("[data-permission-mode]").forEach((option) => {
+    option.classList.toggle("selected", option.dataset.permissionMode === mode);
+  });
+
+  const approvals = state.approvals || [];
+  ui.pendingApprovalCount.textContent = String(approvals.length);
+  ui.approvalCount.textContent = String(approvals.length);
+  ui.approvalCount.classList.toggle("hidden", approvals.length === 0);
+  ui.settingsButton.classList.toggle("attention", approvals.length > 0);
+  ui.approvalList.innerHTML = approvals.length ? approvals.map((approval) => `
+    <article class="approval-card">
+      <div class="approval-card-header">
+        <div><span>TOOL REQUEST</span><strong>${escapeHtml(approval.tool_name)}</strong></div>
+        <time>${escapeHtml(formatClock(approval.created_at))}</time>
+      </div>
+      <p>${escapeHtml(approval.reason)}</p>
+      <pre>${escapeHtml(JSON.stringify(approval.arguments || {}, null, 2))}</pre>
+      <div class="approval-actions">
+        <button class="secondary-button" data-approval-id="${escapeHtml(approval.approval_id)}" data-approval-allow="false">Deny</button>
+        <button class="primary-button" data-approval-id="${escapeHtml(approval.approval_id)}" data-approval-allow="true">Approve</button>
+      </div>
+    </article>`).join("") : `<div class="settings-empty">No tool calls are waiting for approval.</div>`;
+
+  const servers = state.mcpServers || [];
+  ui.mcpServerList.innerHTML = servers.length ? servers.map((server) => `
+    <article class="mcp-server-item">
+      <div><strong>${escapeHtml(server.name)}</strong><small>${escapeHtml((server.tools || []).join(", ") || "No tools")}</small></div>
+      <button class="text-button" data-mcp-disconnect="${escapeHtml(server.name)}">Disconnect</button>
+    </article>`).join("") : `<div class="settings-empty">No user MCP servers connected.</div>`;
+}
+
+async function setPermissionMode(mode) {
+  try {
+    state.permissions = await api("/api/permissions", {
+      method: "PUT",
+      body: JSON.stringify({ mode }),
+    });
+    renderSettingsState();
+    toast(`Permission mode changed to ${mode}.`);
+  } catch (error) {
+    toast(error.message, "error");
+  }
+}
+
+async function resolveApproval(approvalId, allow) {
+  try {
+    await api(`/api/approvals/${encodeURIComponent(approvalId)}`, {
+      method: "POST",
+      body: JSON.stringify({ allow }),
+    });
+    toast(allow ? "Tool call approved." : "Tool call denied.");
+    await loadSettingsState();
+  } catch (error) {
+    toast(error.message, "error");
+    await loadSettingsState();
+  }
+}
+
+async function connectMcpServer(event) {
+  event.preventDefault();
+  let args = [];
+  try {
+    args = ui.mcpArgs.value.trim() ? JSON.parse(ui.mcpArgs.value) : [];
+    if (!Array.isArray(args) || args.some((item) => typeof item !== "string")) {
+      throw new Error("Arguments must be a JSON array of strings.");
+    }
+  } catch (error) {
+    return toast(error.message, "error");
+  }
+  const allowlist = ui.mcpAllowlist.value.split(",").map((item) => item.trim()).filter(Boolean);
+  setBusy(ui.mcpConnectButton, true, "Connecting…");
+  try {
+    await api("/api/mcp/servers", {
+      method: "POST",
+      body: JSON.stringify({
+        name: ui.mcpName.value.trim(),
+        command: ui.mcpCommand.value.trim(),
+        args,
+        tool_allowlist: allowlist.length ? allowlist : null,
+      }),
+    });
+    ui.mcpForm.reset();
+    toast("MCP server connected with an isolated tool namespace.");
+    await loadSettingsState();
+  } catch (error) {
+    toast(error.message, "error");
+  } finally {
+    setBusy(ui.mcpConnectButton, false);
+  }
+}
+
+async function disconnectMcpServer(name) {
+  try {
+    await api(`/api/mcp/servers/${encodeURIComponent(name)}`, { method: "DELETE" });
+    toast(`MCP server ${name} disconnected.`);
+    await loadSettingsState();
+  } catch (error) {
+    toast(error.message, "error");
+  }
+}
+
+async function openSettings() {
+  ui.settingsModal.classList.remove("hidden");
+  try {
+    await loadSettingsState();
+  } catch (error) {
+    toast(error.message, "error");
+  }
+}
+
+function closeSettings() {
+  ui.settingsModal.classList.add("hidden");
 }
 
 async function loadRuns({ preserveSelection = true } = {}) {
@@ -279,6 +433,8 @@ function renderSelectedRun() {
 
   renderTopology(topology);
   renderCheckpoint(run);
+  reconcilePendingSteers(run);
+  renderSteeringHistory();
 }
 
 function agentCard(agent, kind, extraClass = "") {
@@ -322,22 +478,101 @@ function renderTopology(topology) {
       </div>`;
   }).join("");
 
+  const settledDirect = ["completed_retained", "failed_retained", "cancelled_retained", "archived"]
+    .includes(master.status);
   ui.topologyCanvas.innerHTML = `
     <div class="master-row">${agentCard(master, "MASTER", "master-card")}</div>
     ${heads.length ? `<div class="head-grid" style="--head-count:${heads.length}">${headMarkup}</div>` : `
-      <div class="topology-placeholder"><span class="mini-spinner"></span> Master is forming the task graph</div>`}`;
+      <div class="topology-placeholder">
+        ${settledDirect ? "Master completed this Run directly · no delegation was needed" : "<span class=\"mini-spinner\"></span> Master is working directly or deciding whether delegation helps"}
+      </div>`}`;
 }
 
 function renderCheckpoint(run) {
-  if (run.final_response) {
-    ui.checkpointBody.textContent = run.final_response;
-  } else {
+  const checkpoints = Array.isArray(run.checkpoints) && run.checkpoints.length
+    ? run.checkpoints
+    : run.final_response
+      ? [{
+          checkpoint_id: "legacy_latest",
+          revision: run.revision || 0,
+          response: run.final_response,
+          created_at: run.completed_at || run.updated_at,
+        }]
+      : [];
+  if (!checkpoints.length) {
     ui.checkpointBody.innerHTML = `
       <div class="checkpoint-waiting">
         <span class="typing-dots"><i></i><i></i><i></i></span>
         Master has not committed a checkpoint yet.
       </div>`;
+    return;
   }
+  ui.checkpointBody.innerHTML = checkpoints.map((checkpoint) => `
+    <article class="checkpoint-message">
+      <div class="checkpoint-message-meta">
+        <span>MASTER · REV ${escapeHtml(checkpoint.revision ?? 0)}</span>
+        <time>${escapeHtml(formatClock(checkpoint.created_at))}</time>
+      </div>
+      <div class="checkpoint-message-text">${escapeHtml(checkpoint.response || "")}</div>
+    </article>`).join("");
+  ui.checkpointBody.scrollTop = ui.checkpointBody.scrollHeight;
+}
+
+function pendingSteersFor(runId, create = false) {
+  if (!runId) return [];
+  if (!state.pendingSteers.has(runId) && create) state.pendingSteers.set(runId, []);
+  return state.pendingSteers.get(runId) || [];
+}
+
+function reconcilePendingSteers(run) {
+  const pending = pendingSteersFor(run?.run_id);
+  if (!pending.length) return;
+  const requirements = run.requirements || [];
+  const remaining = pending.filter((item) => (
+    item.status === "failed"
+    || !item.revision
+    || requirements[item.revision] !== item.text
+  ));
+  if (remaining.length) state.pendingSteers.set(run.run_id, remaining);
+  else state.pendingSteers.delete(run.run_id);
+}
+
+function renderSteeringHistory() {
+  const run = state.selectedRun;
+  if (!run || run.run_id !== state.selectedRunId) {
+    ui.guidanceSection.classList.add("hidden");
+    ui.guidanceThread.innerHTML = "";
+    return;
+  }
+  const accepted = (run.requirements || []).slice(1).map((text, index) => ({
+    text,
+    revision: index + 1,
+    status: "accepted",
+    timestamp: state.events.find((event) => (
+      event.type === "user_update" && Number(event.payload?.revision) === index + 1
+    ))?.timestamp,
+  }));
+  const pending = pendingSteersFor(run.run_id);
+  const messages = [...accepted, ...pending];
+  ui.guidanceSection.classList.toggle("hidden", messages.length === 0);
+  if (!messages.length) {
+    ui.guidanceThread.innerHTML = "";
+    return;
+  }
+  ui.guidanceThread.innerHTML = messages.map((item) => {
+    const status = item.status || "sending";
+    const revision = item.revision ? `REV ${item.revision}` : "PENDING";
+    const stateLabel = status === "failed" ? "NOT SENT" : status === "sending" ? "SENDING" : "ACCEPTED";
+    return `
+      <article class="guidance-message ${escapeHtml(status)}">
+        <div class="guidance-message-meta">
+          <span>YOU · ${escapeHtml(revision)}</span>
+          <span>${escapeHtml(stateLabel)}${item.timestamp ? ` · ${escapeHtml(formatClock(item.timestamp))}` : ""}</span>
+        </div>
+        <p>${escapeHtml(item.text)}</p>
+      </article>`;
+  }).join("");
+  ui.guidanceThread.scrollTop = ui.guidanceThread.scrollHeight;
 }
 
 async function loadInitialEvents() {
@@ -379,8 +614,13 @@ function openEventStream() {
 }
 
 function scheduleStateRefresh() {
-  window.clearTimeout(state.stateRefreshTimer);
-  state.stateRefreshTimer = window.setTimeout(refreshSelectedRun, 180);
+  // Throttle instead of debounce: a busy event stream must not postpone topology
+  // refresh forever while Heads and Nodes are being added.
+  if (state.stateRefreshTimer) return;
+  state.stateRefreshTimer = window.setTimeout(() => {
+    state.stateRefreshTimer = null;
+    refreshSelectedRun().catch(() => {});
+  }, 120);
 }
 
 function addEvents(events) {
@@ -391,12 +631,30 @@ function addEvents(events) {
     state.eventSequences.add(sequence);
     state.eventCursor = Math.max(state.eventCursor, sequence);
     state.events.push(event);
+    if (event.type === "approval_requested") {
+      loadSettingsState().then(() => ui.settingsModal.classList.remove("hidden")).catch(() => {});
+    } else if (event.type === "approval_resolved" || event.type === "approval_cancelled") {
+      loadSettingsState().catch(() => {});
+    }
+    if (event.type === "user_update" && state.selectedRunId) {
+      const pending = pendingSteersFor(state.selectedRunId);
+      const match = pending.find((item) => (
+        item.text === String(event.payload?.text || "")
+        && (!item.revision || item.revision === Number(event.payload?.revision))
+      ));
+      if (match) {
+        match.revision = Number(event.payload?.revision) || match.revision;
+        match.status = "accepted";
+        match.timestamp = Number(event.timestamp) || match.timestamp;
+      }
+    }
     changed = true;
   }
   if (changed) {
     state.events.sort((a, b) => Number(a.sequence) - Number(b.sequence));
     if (state.events.length > 500) state.events = state.events.slice(-500);
     renderActivity();
+    renderSteeringHistory();
   }
 }
 
@@ -406,6 +664,7 @@ function classifyEvent(event) {
   if (
     type.includes("update") || type.includes("discovery") || type.includes("guidance")
     || type.includes("message") || type.includes("budget") || type.includes("control")
+    || type.includes("approval")
   ) return "control";
   return "agent";
 }
@@ -417,6 +676,8 @@ function eventPresentation(event) {
     agent_registered: ["Agent registered", "A new owner entered the Run", "＋"],
     agent_phase_started: ["Agent phase started", payload.contract?.goal || "Execution phase opened", "▶"],
     agent_phase_finished: ["Agent settled", payload.summary || payload.status || "Outcome recorded", "✓"],
+    agent_step_started: ["Agent working", payload.message || payload.step || "Step started", "▶"],
+    agent_step_finished: ["Agent step finished", payload.message || payload.step || "Step finished", "✓"],
     agent_resumed: ["Agent resumed", payload.guidance || "Retained context reopened", "↻"],
     tool_call: [`Tool · ${payload.name || "call"}`, JSON.stringify(payload.arguments || {}), "T"],
     tool_result: [`Result · ${payload.name || "tool"}`, payload.result || "Result recorded", "↳"],
@@ -427,12 +688,20 @@ function eventPresentation(event) {
     ],
     user_update: ["User revision accepted", payload.text || "Requirement changed", "U"],
     user_update_applied: ["Master routed revision", payload.update || "Revision applied", "M"],
+    master_step_started: ["Master working", payload.message || payload.step || "Step started", "M"],
+    master_step_finished: ["Master step finished", payload.message || payload.step || "Step finished", "✓"],
+    master_direct_response: ["Master answered directly", payload.message || "No delegation needed", "M"],
+    run_checkpoint_committed: ["Checkpoint committed", "The final response is ready", "✓"],
     guidance_applied: ["Head applied guidance", payload.guidance || "Contract updated", "H"],
     control_action: [`Control · ${payload.name || "action"}`, JSON.stringify(payload.result || {}), "C"],
     discovery_triaged: ["Discovery triaged", payload.discovery?.description || "Scope observation handled", "D"],
     head_discovery_triaged: ["Master triaged discovery", payload.discovery?.description || "Topology decision made", "D"],
     head_budget_exhausted: ["Head budget reached", "Remaining contracts were deferred", "!"],
     master_budget_exhausted: ["Run time budget reached", "Master committed the best available checkpoint", "!"],
+    approval_requested: [`Approval · ${payload.tool_name || "tool"}`, payload.reason || "Waiting for user decision", "✋"],
+    approval_resolved: [`Approval · ${payload.allowed ? "allowed" : "denied"}`, payload.tool_name || "Tool decision recorded", payload.allowed ? "✓" : "×"],
+    approval_cancelled: ["Approval cancelled", payload.reason || "Owning phase ended", "×"],
+    approval_expired: ["Approval expired", payload.reason || "No decision was received", "×"],
   };
   return map[type] || [type.replaceAll("_", " "), summarizePayload(payload), "·"];
 }
@@ -583,16 +852,40 @@ async function steerRun(event) {
   event.preventDefault();
   const requirement = ui.steerInput.value.trim();
   if (!state.selectedRunId || !requirement) return;
+  const runId = state.selectedRunId;
+  const pending = {
+    clientId: globalThis.crypto?.randomUUID?.() || `${Date.now()}-${Math.random()}`,
+    text: requirement,
+    revision: null,
+    status: "sending",
+    timestamp: Date.now() / 1000,
+  };
+  const runPending = pendingSteersFor(runId, true);
+  for (let index = runPending.length - 1; index >= 0; index -= 1) {
+    if (runPending[index].status === "failed" && runPending[index].text === requirement) {
+      runPending.splice(index, 1);
+    }
+  }
+  runPending.push(pending);
+  ui.steerInput.value = "";
   ui.steerButton.disabled = true;
+  renderSteeringHistory();
   try {
-    const payload = await api(`/api/runs/${encodeURIComponent(state.selectedRunId)}/steer`, {
+    const payload = await api(`/api/runs/${encodeURIComponent(runId)}/steer`, {
       method: "POST",
       body: JSON.stringify({ requirement }),
     });
-    ui.steerInput.value = "";
+    pending.revision = Number(payload.revision) || null;
+    pending.status = "accepted";
+    renderSteeringHistory();
     toast(`Revision ${payload.revision} accepted by Master.`);
-    await refreshSelectedRun();
+    if (state.selectedRunId === runId) await refreshSelectedRun();
   } catch (error) {
+    pending.status = "failed";
+    if (state.selectedRunId === runId && !ui.steerInput.value) {
+      ui.steerInput.value = requirement;
+    }
+    renderSteeringHistory();
     toast(error.message, "error");
   } finally {
     ui.steerButton.disabled = (
@@ -656,6 +949,24 @@ function bindEvents() {
   ui.requirementsModal.addEventListener("click", (event) => {
     if (event.target === ui.requirementsModal) closeRequirements();
   });
+  ui.settingsButton.addEventListener("click", openSettings);
+  ui.settingsClose.addEventListener("click", closeSettings);
+  ui.settingsModal.addEventListener("click", (event) => {
+    if (event.target === ui.settingsModal) closeSettings();
+  });
+  ui.permissionOptions.addEventListener("click", (event) => {
+    const option = event.target.closest("[data-permission-mode]");
+    if (option) setPermissionMode(option.dataset.permissionMode);
+  });
+  ui.approvalList.addEventListener("click", (event) => {
+    const button = event.target.closest("[data-approval-id]");
+    if (button) resolveApproval(button.dataset.approvalId, button.dataset.approvalAllow === "true");
+  });
+  ui.mcpForm.addEventListener("submit", connectMcpServer);
+  ui.mcpServerList.addEventListener("click", (event) => {
+    const button = event.target.closest("[data-mcp-disconnect]");
+    if (button) disconnectMcpServer(button.dataset.mcpDisconnect);
+  });
   ui.copyResponseButton.addEventListener("click", async () => {
     const response = state.selectedRun?.final_response;
     if (!response) return toast("No checkpoint to copy yet.", "error");
@@ -674,6 +985,7 @@ function bindEvents() {
     if (event.key === "Escape") {
       closeDrawer();
       closeRequirements();
+      closeSettings();
       ui.runsPanel.classList.remove("mobile-open");
     }
   });
@@ -682,12 +994,13 @@ function bindEvents() {
 
 async function initialize() {
   bindEvents();
-  await Promise.all([loadHealth(), loadRuns({ preserveSelection: false })]);
+  await Promise.all([loadHealth(), loadSettingsState(), loadRuns({ preserveSelection: false })]);
   state.listRefreshTimer = window.setInterval(async () => {
     await loadRuns();
     // SSE carries actions, while this poll also catches status-only transitions
     // such as Master committing a final checkpoint.
     if (state.selectedRunId) await refreshSelectedRun();
+    await loadSettingsState();
   }, 5000);
 }
 

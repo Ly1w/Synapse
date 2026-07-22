@@ -161,11 +161,6 @@ button:disabled {
   position: relative;
 }
 
-.permission-chip.attention {
-  border-color: rgba(243, 185, 95, 0.55);
-  color: var(--amber);
-}
-
 .approval-count {
   min-width: 17px;
   height: 17px;
@@ -176,6 +171,26 @@ button:disabled {
   color: #17100e;
   font-size: 9px;
   font-weight: 800;
+}
+
+.approval-count:hover {
+  box-shadow: 0 0 0 3px rgba(255, 107, 71, 0.16);
+}
+
+.activity-toggle-button {
+  position: relative;
+  display: none;
+}
+
+.activity-toggle-button .approval-count {
+  position: absolute;
+  top: -6px;
+  right: -6px;
+}
+
+.activity-toggle-button.attention {
+  border-color: rgba(243, 185, 95, 0.55);
+  color: var(--amber);
 }
 
 .pulse-dot {
@@ -1190,11 +1205,21 @@ button.agent-card:hover {
   background: #0f1116;
 }
 
+.activity-backdrop {
+  display: none;
+}
+
 .activity-header {
   display: flex;
   align-items: center;
   justify-content: space-between;
   padding: 20px 18px 12px;
+}
+
+.activity-header-state {
+  display: flex;
+  align-items: center;
+  gap: 8px;
 }
 
 .activity-header h2 {
@@ -1356,6 +1381,109 @@ button.agent-card:hover {
   color: #555e69;
   font-family: var(--mono);
   font-size: 8px;
+}
+
+.event-approval {
+  margin: 7px 0 12px;
+  padding: 12px 10px 14px;
+  border: 1px solid rgba(243, 185, 95, 0.46);
+  border-radius: 9px;
+  background: rgba(243, 185, 95, 0.055);
+}
+
+.event-approval:not(:last-child)::after {
+  display: none;
+}
+
+.event-approval .event-icon {
+  border-color: rgba(243, 185, 95, 0.4);
+  color: var(--amber);
+}
+
+.event-approval-status {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  margin: 7px 0;
+  color: var(--amber);
+  font-family: var(--mono);
+  font-size: 8px;
+  letter-spacing: 0.08em;
+}
+
+.event-approval-status code {
+  overflow: hidden;
+  color: var(--faint);
+  font-size: 8px;
+  letter-spacing: 0;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.event-approval-reason {
+  margin: 0 0 8px;
+  color: var(--muted);
+  font-size: 9px;
+  line-height: 1.5;
+}
+
+.event-approval-arguments {
+  max-height: 150px;
+  overflow: auto;
+  margin: 0;
+  padding: 8px;
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  background: #0c0e12;
+  color: #aeb6c1;
+  font-family: var(--mono);
+  font-size: 8px;
+  line-height: 1.45;
+  overflow-wrap: anywhere;
+  white-space: pre-wrap;
+}
+
+.event-approval-actions {
+  position: relative;
+  z-index: 2;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  margin-top: 10px;
+  pointer-events: auto;
+}
+
+.event-approval-actions > div {
+  display: flex;
+  gap: 6px;
+}
+
+.event-approval-actions .primary-button,
+.event-approval-actions .secondary-button {
+  min-height: 30px;
+  padding-inline: 10px;
+  font-size: 10px;
+  pointer-events: auto;
+}
+
+.activity-history-divider {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin: 7px 0;
+  color: var(--faint);
+  font-family: var(--mono);
+  font-size: 8px;
+  letter-spacing: 0.1em;
+}
+
+.activity-history-divider::after {
+  height: 1px;
+  flex: 1;
+  content: "";
+  background: var(--line);
 }
 
 .agent-drawer {
@@ -1646,74 +1774,16 @@ button.agent-card:hover {
   text-align: center;
 }
 
-.approval-list,
 .mcp-server-list {
   display: grid;
   gap: 8px;
 }
 
-.approval-card {
-  padding: 13px;
-  border: 1px solid rgba(243, 185, 95, 0.34);
-  border-radius: 9px;
-  background: rgba(243, 185, 95, 0.055);
-}
-
-.approval-card-header,
-.approval-actions,
 .mcp-server-item {
   display: flex;
   align-items: center;
   justify-content: space-between;
   gap: 10px;
-}
-
-.approval-card-header span,
-.approval-card-header strong {
-  display: block;
-}
-
-.approval-card-header span {
-  margin-bottom: 3px;
-  color: var(--amber);
-  font-family: var(--mono);
-  font-size: 8px;
-  letter-spacing: 0.1em;
-}
-
-.approval-card-header strong {
-  font-size: 13px;
-}
-
-.approval-card-header time {
-  color: var(--faint);
-  font-family: var(--mono);
-  font-size: 8px;
-}
-
-.approval-card p {
-  margin: 10px 0;
-  color: var(--muted);
-  font-size: 10px;
-  line-height: 1.5;
-}
-
-.approval-card pre {
-  max-height: 180px;
-  overflow: auto;
-  margin: 0 0 11px;
-  padding: 9px;
-  border: 1px solid var(--line);
-  border-radius: 6px;
-  background: #0c0e12;
-  color: #aeb6c1;
-  font-family: var(--mono);
-  font-size: 9px;
-  white-space: pre-wrap;
-}
-
-.approval-actions {
-  justify-content: flex-end;
 }
 
 .mcp-server-item {
@@ -1890,7 +1960,34 @@ button.agent-card:hover {
   }
 
   .activity-panel {
-    display: none;
+    position: fixed;
+    top: 68px;
+    right: 0;
+    bottom: 0;
+    z-index: 45;
+    width: min(360px, 94vw);
+    display: flex;
+    border-left: 1px solid var(--line-bright);
+    box-shadow: -20px 0 50px rgba(0, 0, 0, 0.5);
+    transform: translateX(105%);
+    transition: transform 180ms ease;
+  }
+
+  .activity-panel.mobile-open {
+    transform: translateX(0);
+  }
+
+  .activity-backdrop {
+    position: fixed;
+    inset: 68px 0 0;
+    z-index: 44;
+    display: block;
+    background: rgba(3, 4, 6, 0.55);
+    backdrop-filter: blur(2px);
+  }
+
+  .activity-toggle-button {
+    display: grid;
   }
 }
 
@@ -1904,6 +2001,14 @@ button.agent-card:hover {
     top: 0;
     height: 60px;
     padding: 0 14px;
+  }
+
+  .activity-panel {
+    top: 60px;
+  }
+
+  .activity-backdrop {
+    inset: 60px 0 0;
   }
 
   .model-chip {

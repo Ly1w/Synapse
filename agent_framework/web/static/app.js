@@ -6,6 +6,7 @@ const ui = {
   settingsButton: document.querySelector("#settingsButton"),
   permissionLabel: document.querySelector("#permissionLabel"),
   approvalCount: document.querySelector("#approvalCount"),
+  mobileApprovalCount: document.querySelector("#mobileApprovalCount"),
   newRunForm: document.querySelector("#newRunForm"),
   requestInput: document.querySelector("#requestInput"),
   launchButton: document.querySelector("#launchButton"),
@@ -32,6 +33,9 @@ const ui = {
   archiveButton: document.querySelector("#archiveButton"),
   activityList: document.querySelector("#activityList"),
   activityFilters: document.querySelector("#activityFilters"),
+  activityPanel: document.querySelector("#activityPanel"),
+  activityToggleButton: document.querySelector("#activityToggleButton"),
+  activityBackdrop: document.querySelector("#activityBackdrop"),
   drawerBackdrop: document.querySelector("#drawerBackdrop"),
   agentDrawer: document.querySelector("#agentDrawer"),
   drawerClose: document.querySelector("#drawerClose"),
@@ -47,8 +51,6 @@ const ui = {
   settingsClose: document.querySelector("#settingsClose"),
   permissionOptions: document.querySelector("#permissionOptions"),
   workspaceRoot: document.querySelector("#workspaceRoot"),
-  pendingApprovalCount: document.querySelector("#pendingApprovalCount"),
-  approvalList: document.querySelector("#approvalList"),
   mcpServerList: document.querySelector("#mcpServerList"),
   mcpForm: document.querySelector("#mcpForm"),
   mcpName: document.querySelector("#mcpName"),
@@ -74,6 +76,7 @@ const state = {
   listRefreshTimer: null,
   permissions: null,
   approvals: [],
+  resolvingApprovals: new Set(),
   mcpServers: [],
   pendingSteers: new Map(),
   missingRunRecovery: null,
@@ -197,6 +200,9 @@ async function loadHealth() {
 }
 
 async function loadSettingsState() {
+  const previousApprovalIds = new Set(
+    state.approvals.map((item) => String(item.approval_id || "")),
+  );
   const [permissions, mcp] = await Promise.all([
     api("/api/permissions"),
     api("/api/mcp/servers"),
@@ -205,9 +211,31 @@ async function loadSettingsState() {
   state.approvals = permissions.pending || [];
   state.mcpServers = mcp.servers || [];
   renderSettingsState();
+  focusNewApproval(previousApprovalIds);
 }
 
-function renderSettingsState() {
+async function loadPermissionState() {
+  const previousApprovalIds = new Set(
+    state.approvals.map((item) => String(item.approval_id || "")),
+  );
+  const permissions = await api("/api/permissions");
+  state.permissions = permissions;
+  state.approvals = permissions.pending || [];
+  renderPermissionState();
+  focusNewApproval(previousApprovalIds);
+}
+
+function focusNewApproval(previousApprovalIds) {
+  const hasNewApproval = state.approvals.some(
+    (item) => !previousApprovalIds.has(String(item.approval_id || "")),
+  );
+  if (!hasNewApproval) return;
+  window.requestAnimationFrame(() => {
+    ui.activityList.scrollTo({ top: 0, behavior: "smooth" });
+  });
+}
+
+function renderPermissionState() {
   const mode = state.permissions?.mode || "auto";
   ui.permissionLabel.textContent = `PERMISSION ${mode.toUpperCase()}`;
   ui.workspaceRoot.textContent = state.permissions?.workspace_root || "—";
@@ -216,24 +244,20 @@ function renderSettingsState() {
   });
 
   const approvals = state.approvals || [];
-  ui.pendingApprovalCount.textContent = String(approvals.length);
   ui.approvalCount.textContent = String(approvals.length);
   ui.approvalCount.classList.toggle("hidden", approvals.length === 0);
-  ui.settingsButton.classList.toggle("attention", approvals.length > 0);
-  ui.approvalList.innerHTML = approvals.length ? approvals.map((approval) => `
-    <article class="approval-card">
-      <div class="approval-card-header">
-        <div><span>TOOL REQUEST</span><strong>${escapeHtml(approval.tool_name)}</strong></div>
-        <time>${escapeHtml(formatClock(approval.created_at))}</time>
-      </div>
-      <p>${escapeHtml(approval.reason)}</p>
-      <pre>${escapeHtml(JSON.stringify(approval.arguments || {}, null, 2))}</pre>
-      <div class="approval-actions">
-        <button class="secondary-button" data-approval-id="${escapeHtml(approval.approval_id)}" data-approval-allow="false">Deny</button>
-        <button class="primary-button" data-approval-id="${escapeHtml(approval.approval_id)}" data-approval-allow="true">Approve</button>
-      </div>
-    </article>`).join("") : `<div class="settings-empty">No tool calls are waiting for approval.</div>`;
+  ui.mobileApprovalCount.textContent = String(approvals.length);
+  ui.mobileApprovalCount.classList.toggle("hidden", approvals.length === 0);
+  ui.activityToggleButton.classList.toggle("attention", approvals.length > 0);
+  ui.approvalCount.setAttribute(
+    "aria-label",
+    `${approvals.length} tool ${approvals.length === 1 ? "call" : "calls"} waiting for approval`,
+  );
+  renderActivity();
+}
 
+function renderSettingsState() {
+  renderPermissionState();
   const servers = state.mcpServers || [];
   ui.mcpServerList.innerHTML = servers.length ? servers.map((server) => `
     <article class="mcp-server-item">
@@ -256,16 +280,25 @@ async function setPermissionMode(mode) {
 }
 
 async function resolveApproval(approvalId, allow) {
+  if (!approvalId || state.resolvingApprovals.has(approvalId)) return;
+  state.resolvingApprovals.add(approvalId);
+  renderActivity();
   try {
     await api(`/api/approvals/${encodeURIComponent(approvalId)}`, {
       method: "POST",
       body: JSON.stringify({ allow }),
     });
     toast(allow ? "Tool call approved." : "Tool call denied.");
-    await loadSettingsState();
   } catch (error) {
     toast(error.message, "error");
-    await loadSettingsState();
+  } finally {
+    state.resolvingApprovals.delete(approvalId);
+    try {
+      await loadPermissionState();
+    } catch (error) {
+      renderActivity();
+      toast(`Could not refresh approvals: ${error.message}`, "error");
+    }
   }
 }
 
@@ -323,6 +356,24 @@ async function openSettings() {
 
 function closeSettings() {
   ui.settingsModal.classList.add("hidden");
+}
+
+function closeActivityPanel() {
+  ui.activityPanel.classList.remove("mobile-open");
+  ui.activityBackdrop.classList.add("hidden");
+  ui.activityToggleButton.setAttribute("aria-expanded", "false");
+}
+
+function openActivityPanel() {
+  state.eventFilter = "all";
+  ui.activityFilters.querySelectorAll(".filter-chip").forEach((item) => {
+    item.classList.toggle("active", item.dataset.filter === "all");
+  });
+  renderActivity();
+  ui.activityPanel.classList.add("mobile-open");
+  ui.activityBackdrop.classList.remove("hidden");
+  ui.activityToggleButton.setAttribute("aria-expanded", "true");
+  ui.activityList.scrollTo({ top: 0, behavior: "smooth" });
 }
 
 async function loadRuns({ preserveSelection = true } = {}) {
@@ -691,9 +742,13 @@ function addEvents(events) {
     state.eventCursor = Math.max(state.eventCursor, sequence);
     state.events.push(event);
     if (event.type === "approval_requested") {
-      loadSettingsState().then(() => ui.settingsModal.classList.remove("hidden")).catch(() => {});
-    } else if (event.type === "approval_resolved" || event.type === "approval_cancelled") {
-      loadSettingsState().catch(() => {});
+      loadPermissionState().catch(() => {});
+    } else if (
+      event.type === "approval_resolved"
+      || event.type === "approval_cancelled"
+      || event.type === "approval_expired"
+    ) {
+      loadPermissionState().catch(() => {});
     }
     if (event.type === "user_update" && state.selectedRunId) {
       const pending = pendingSteersFor(state.selectedRunId);
@@ -775,12 +830,53 @@ function summarizePayload(payload) {
   return keys.length ? keys.slice(0, 4).join(" · ") : "Event recorded";
 }
 
+function renderPendingApproval(approval) {
+  const approvalId = String(approval.approval_id || "");
+  const resolving = state.resolvingApprovals.has(approvalId);
+  const origin = [
+    approval.run_id ? `RUN ${shortId(approval.run_id, 16)}` : "UNSCOPED RUN",
+    approval.agent_id ? `AGENT ${shortId(approval.agent_id, 14)}` : "",
+  ].filter(Boolean).join(" · ");
+  return `
+    <article class="event-item tool event-approval" data-pending-approval="${escapeHtml(approvalId)}">
+      <div class="event-icon">✋</div>
+      <div class="event-copy">
+        <div class="event-title-row">
+          <span class="event-title">Approval · ${escapeHtml(approval.tool_name || "tool")}</span>
+          <time class="event-time">${escapeHtml(formatClock(approval.created_at))}</time>
+        </div>
+        <div class="event-approval-status">
+          <span>${resolving ? "SUBMITTING" : "ACTION REQUIRED"}</span>
+          <code>${escapeHtml(approval.risk || "external")}</code>
+        </div>
+        <p class="event-approval-reason">${escapeHtml(approval.reason || "This tool call requires your decision.")}</p>
+        <pre class="event-approval-arguments">${escapeHtml(JSON.stringify(approval.arguments || {}, null, 2))}</pre>
+        <div class="event-source">${escapeHtml(origin)}</div>
+        <div class="event-approval-actions">
+          ${approval.run_id && approval.run_id !== state.selectedRunId ? `
+            <button type="button" class="text-button" data-approval-run-id="${escapeHtml(approval.run_id)}">View run</button>
+          ` : "<span></span>"}
+          <div>
+            <button type="button" class="secondary-button" data-approval-id="${escapeHtml(approvalId)}" data-approval-allow="false" ${resolving ? "disabled" : ""}>Deny</button>
+            <button type="button" class="primary-button" data-approval-id="${escapeHtml(approvalId)}" data-approval-allow="true" ${resolving ? "disabled" : ""}>Allow</button>
+          </div>
+        </div>
+      </div>
+    </article>`;
+}
+
 function renderActivity() {
+  const approvals = state.approvals || [];
+  const pendingIds = new Set(approvals.map((item) => String(item.approval_id || "")));
   const visible = state.events
     .filter((event) => state.eventFilter === "all" || classifyEvent(event) === state.eventFilter)
+    .filter((event) => !(
+      event.type === "approval_requested"
+      && pendingIds.has(String(event.payload?.approval_id || ""))
+    ))
     .slice()
     .reverse();
-  if (!visible.length) {
+  if (!visible.length && !approvals.length) {
     ui.activityList.innerHTML = `
       <div class="activity-empty">
         <svg viewBox="0 0 48 48" aria-hidden="true"><path d="M8 24h8l4-10 7 22 5-12h8" /></svg>
@@ -788,7 +884,8 @@ function renderActivity() {
       </div>`;
     return;
   }
-  ui.activityList.innerHTML = visible.map((event) => {
+  const approvalMarkup = approvals.map(renderPendingApproval).join("");
+  const historyMarkup = visible.map((event) => {
     const category = classifyEvent(event);
     const [title, detail, icon] = eventPresentation(event);
     return `
@@ -804,6 +901,11 @@ function renderActivity() {
         </div>
       </article>`;
   }).join("");
+  ui.activityList.innerHTML = `${approvalMarkup}${
+    approvals.length && visible.length
+      ? '<div class="activity-history-divider"><span>EVENT HISTORY</span></div>'
+      : ""
+  }${historyMarkup}`;
 }
 
 async function openAgent(agentId, kind) {
@@ -1002,6 +1104,32 @@ function bindEvents() {
     });
     renderActivity();
   });
+  ui.activityList.addEventListener("click", (event) => {
+    const decision = event.target.closest("[data-approval-id]");
+    if (decision) {
+      event.preventDefault();
+      resolveApproval(
+        decision.dataset.approvalId,
+        decision.dataset.approvalAllow === "true",
+      );
+      return;
+    }
+    const runLink = event.target.closest("[data-approval-run-id]");
+    if (runLink) selectRun(runLink.dataset.approvalRunId);
+  });
+  ui.approvalCount.addEventListener("click", () => {
+    state.eventFilter = "all";
+    ui.activityFilters.querySelectorAll(".filter-chip").forEach((item) => {
+      item.classList.toggle("active", item.dataset.filter === "all");
+    });
+    renderActivity();
+    ui.activityList.scrollTo({ top: 0, behavior: "smooth" });
+  });
+  ui.activityToggleButton.addEventListener("click", () => {
+    if (ui.activityPanel.classList.contains("mobile-open")) closeActivityPanel();
+    else openActivityPanel();
+  });
+  ui.activityBackdrop.addEventListener("click", closeActivityPanel);
   ui.drawerClose.addEventListener("click", closeDrawer);
   ui.drawerBackdrop.addEventListener("click", closeDrawer);
   ui.showRequirementsButton.addEventListener("click", openRequirements);
@@ -1017,10 +1145,6 @@ function bindEvents() {
   ui.permissionOptions.addEventListener("click", (event) => {
     const option = event.target.closest("[data-permission-mode]");
     if (option) setPermissionMode(option.dataset.permissionMode);
-  });
-  ui.approvalList.addEventListener("click", (event) => {
-    const button = event.target.closest("[data-approval-id]");
-    if (button) resolveApproval(button.dataset.approvalId, button.dataset.approvalAllow === "true");
   });
   ui.mcpForm.addEventListener("submit", connectMcpServer);
   ui.mcpServerList.addEventListener("click", (event) => {
@@ -1046,6 +1170,7 @@ function bindEvents() {
       closeDrawer();
       closeRequirements();
       closeSettings();
+      closeActivityPanel();
       ui.runsPanel.classList.remove("mobile-open");
     }
   });

@@ -1172,6 +1172,11 @@ def test_web_control_room_runs_against_the_real_runtime_api(tmp_path: Path):
             assert "Synapse" in index_response.text
             assert 'id="guidanceThread"' in index_response.text
             assert "MASTER CHECKPOINTS" in index_response.text
+            assert 'id="approvalCount"' in index_response.text
+            assert 'id="activityToggleButton"' in index_response.text
+            assert 'id="activityPanel"' in index_response.text
+            assert 'id="approvalList"' not in index_response.text
+            assert index_response.text.index('id="approvalCount"') > index_response.text.index("EVENT STREAM")
             script_response = client.get("/static/app.js")
             assert script_response.status_code == 200
             assert "pendingSteersFor" in script_response.text
@@ -1179,6 +1184,11 @@ def test_web_control_room_runs_against_the_real_runtime_api(tmp_path: Path):
             assert "recoverMissingRun" in script_response.text
             assert "error.status = response.status" in script_response.text
             assert "run-error-message" in script_response.text
+            assert "renderPendingApproval" in script_response.text
+            assert "data-approval-allow" in script_response.text
+            assert "settingsModal.classList.remove" not in script_response.text.split(
+                'event.type === "approval_requested"', 1
+            )[1].split("function classifyEvent", 1)[0]
             health = client.get("/api/health").json()
             assert health["search"] == {
                 "status": "ready", "tools": ["WebSearch", "WebFetch"]

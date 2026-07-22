@@ -31,9 +31,19 @@
         <div class="model-chip search-chip" id="searchChip">SEARCH —</div>
         <button class="model-chip permission-chip" id="settingsButton" type="button">
           <span id="permissionLabel">PERMISSION —</span>
-          <span class="approval-count hidden" id="approvalCount">0</span>
         </button>
         <div class="model-chip" id="modelChip">MODEL —</div>
+        <button
+          class="icon-button activity-toggle-button"
+          id="activityToggleButton"
+          type="button"
+          aria-label="Show event stream"
+          aria-controls="activityPanel"
+          aria-expanded="false"
+        >
+          <svg viewBox="0 0 20 20" aria-hidden="true"><path d="M3 5h14M3 10h14M3 15h14" /></svg>
+          <span class="approval-count hidden" id="mobileApprovalCount">0</span>
+        </button>
         <button class="icon-button mobile-runs-button" id="mobileRunsButton" aria-label="Show runs">
           <span></span><span></span><span></span>
         </button>
@@ -196,13 +206,16 @@
         </div>
       </main>
 
-      <aside class="activity-panel">
+      <aside class="activity-panel" id="activityPanel" aria-label="Event stream">
         <div class="activity-header">
           <div>
             <div class="section-kicker">EVENT STREAM</div>
             <h2>Activity</h2>
           </div>
-          <div class="live-indicator"><i></i>LIVE</div>
+          <div class="activity-header-state">
+            <button class="approval-count hidden" id="approvalCount" type="button" aria-label="Pending tool approvals">0</button>
+            <div class="live-indicator"><i></i>LIVE</div>
+          </div>
         </div>
         <div class="activity-filters" id="activityFilters">
           <button class="filter-chip active" data-filter="all">All</button>
@@ -219,6 +232,7 @@
       </aside>
     </div>
 
+    <div class="activity-backdrop hidden" id="activityBackdrop"></div>
     <div class="drawer-backdrop hidden" id="drawerBackdrop"></div>
     <aside class="agent-drawer" id="agentDrawer" aria-hidden="true">
       <div class="drawer-header">
@@ -282,16 +296,6 @@
               <span><strong>Full access</strong><small>Do not approval-gate filesystem, shell, internet, or MCP tool calls.</small></span>
               <i></i>
             </button>
-          </div>
-        </section>
-
-        <section class="settings-section">
-          <div class="settings-section-title">
-            <span>PENDING APPROVALS</span>
-            <span class="count-badge" id="pendingApprovalCount">0</span>
-          </div>
-          <div class="approval-list" id="approvalList">
-            <div class="settings-empty">No tool calls are waiting for approval.</div>
           </div>
         </section>
 

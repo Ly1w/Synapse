@@ -76,6 +76,7 @@ const state = {
   approvals: [],
   mcpServers: [],
   pendingSteers: new Map(),
+  missingRunRecovery: null,
 };
 
 const STATUS_LABELS = {
@@ -146,7 +147,10 @@ async function api(path, options = {}) {
     payload = {};
   }
   if (!response.ok) {
-    throw new Error(payload.detail || `Request failed (${response.status})`);
+    const error = new Error(payload.detail || `Request failed (${response.status})`);
+    error.status = response.status;
+    error.payload = payload;
+    throw error;
   }
   return payload;
 }
@@ -325,6 +329,13 @@ async function loadRuns({ preserveSelection = true } = {}) {
   try {
     const payload = await api("/api/runs");
     state.runs = payload.runs || [];
+    if (
+      state.selectedRunId
+      && !state.runs.some((run) => run.run_id === state.selectedRunId)
+    ) {
+      clearSelectedRun(state.selectedRunId);
+      preserveSelection = false;
+    }
     renderRunList();
     if (!preserveSelection || !state.selectedRunId) {
       const preferred = state.runs.find((run) => run.status === "running") || state.runs[0];
@@ -332,6 +343,41 @@ async function loadRuns({ preserveSelection = true } = {}) {
     }
   } catch (error) {
     ui.runList.innerHTML = `<div class="activity-empty"><p>${escapeHtml(error.message)}</p></div>`;
+  }
+}
+
+function clearSelectedRun(runId = state.selectedRunId) {
+  if (runId && state.selectedRunId && runId !== state.selectedRunId) return;
+  closeEventStream();
+  if (state.stateRefreshTimer) {
+    window.clearTimeout(state.stateRefreshTimer);
+    state.stateRefreshTimer = null;
+  }
+  if (runId) state.pendingSteers.delete(runId);
+  state.selectedRunId = null;
+  state.selectedRun = null;
+  state.events = [];
+  state.eventSequences.clear();
+  state.eventCursor = 0;
+  ui.runView.classList.add("hidden");
+  ui.emptyState.classList.remove("hidden");
+  closeDrawer();
+  renderRunList();
+  renderActivity();
+  renderSteeringHistory();
+}
+
+async function recoverMissingRun(runId) {
+  if (!runId || state.selectedRunId !== runId) return;
+  if (state.missingRunRecovery) return;
+  state.missingRunRecovery = (async () => {
+    clearSelectedRun(runId);
+    await loadRuns({ preserveSelection: false });
+  })();
+  try {
+    await state.missingRunRecovery;
+  } finally {
+    state.missingRunRecovery = null;
   }
 }
 
@@ -375,16 +421,18 @@ async function selectRun(runId) {
   renderActivity();
   try {
     await Promise.all([refreshSelectedRun(), loadInitialEvents()]);
-    openEventStream();
+    if (state.selectedRunId === runId) openEventStream();
   } catch (error) {
-    toast(error.message, "error");
+    if (error.status === 404) await recoverMissingRun(runId);
+    else toast(error.message, "error");
   }
 }
 
 async function refreshSelectedRun() {
   if (!state.selectedRunId) return;
+  const runId = state.selectedRunId;
   try {
-    const run = await api(`/api/runs/${encodeURIComponent(state.selectedRunId)}`);
+    const run = await api(`/api/runs/${encodeURIComponent(runId)}`);
     if (run.run_id !== state.selectedRunId) return;
     state.selectedRun = run;
     const index = state.runs.findIndex((item) => item.run_id === run.run_id);
@@ -393,12 +441,8 @@ async function refreshSelectedRun() {
     renderRunList();
     renderSelectedRun();
   } catch (error) {
-    if (error.message.includes("Unknown run")) {
-      state.selectedRunId = null;
-      state.selectedRun = null;
-      ui.emptyState.classList.remove("hidden");
-      ui.runView.classList.add("hidden");
-    }
+    if (error.status === 404) return recoverMissingRun(runId);
+    throw error;
   }
 }
 
@@ -591,8 +635,9 @@ function closeEventStream() {
 function openEventStream() {
   if (!state.selectedRunId) return;
   closeEventStream();
+  const runId = state.selectedRunId;
   const source = new EventSource(
-    `/api/runs/${encodeURIComponent(state.selectedRunId)}/stream?after=${state.eventCursor}`,
+    `/api/runs/${encodeURIComponent(runId)}/stream?after=${state.eventCursor}`,
   );
   source.addEventListener("run_event", (message) => {
     try {
@@ -603,8 +648,13 @@ function openEventStream() {
     }
   });
   source.onerror = () => {
+    if (source !== state.eventSource) return;
     ui.connectionBadge.classList.add("offline");
     ui.connectionLabel.textContent = "Reconnecting";
+    // EventSource hides the HTTP status of a failed connection. Verify the Run
+    // through the JSON endpoint so a removed/stale selection closes this stream
+    // instead of retrying a 404 forever. Transient network errors keep reconnecting.
+    refreshSelectedRun().catch(() => {});
   };
   source.onopen = () => {
     ui.connectionBadge.classList.remove("offline");

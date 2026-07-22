@@ -1100,6 +1100,8 @@ def test_web_control_room_runs_against_the_real_runtime_api(tmp_path: Path):
             assert script_response.status_code == 200
             assert "pendingSteersFor" in script_response.text
             assert "checkpoint-message" in script_response.text
+            assert "recoverMissingRun" in script_response.text
+            assert "error.status = response.status" in script_response.text
             health = client.get("/api/health").json()
             assert health["search"] == {
                 "status": "ready", "tools": ["WebSearch", "WebFetch"]
@@ -1110,6 +1112,8 @@ def test_web_control_room_runs_against_the_real_runtime_api(tmp_path: Path):
             )
             assert client.put("/api/permissions", json={"mode": "ask"}).json()["mode"] == "ask"
             assert client.get("/api/permissions").json()["pending"] == []
+            assert client.get("/api/runs/run_missing").status_code == 404
+            assert client.get("/api/runs/run_missing/stream").status_code == 404
 
             created = client.post("/api/runs", json={"request": "Do the web work"})
             assert created.status_code == 202

@@ -1,66 +1,148 @@
-"""Web and academic paper search tools."""
+"""Keyless web search and academic paper search tools."""
 
 import json
+import re
 from typing import Optional
+from urllib.parse import parse_qs, unquote, urlparse
 
 import httpx
+from bs4 import BeautifulSoup
 
 from .config import (
-    SERPER_API_KEY,
-    SERPER_BASE_URL,
     SEMANTIC_SCHOLAR_BASE_URL,
+    WEB_SEARCH_URL,
 )
 
 
-def search_web(query: str, max_results: int = 5) -> str:
-    """Search the web via Serper (Google Search API).
+_SEARCH_HEADERS = {
+    "User-Agent": (
+        "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
+        "(KHTML, like Gecko) Chrome/124.0 Safari/537.36"
+    ),
+    "Accept-Language": "en-US,en;q=0.8",
+}
+_DOMAIN_PATTERN = re.compile(r"^(?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z]{2,63}$", re.I)
 
-    Returns a JSON string containing a list of results, each with:
-      - title: page title
-      - url: page URL
-      - snippet: short excerpt
+
+def _normalize_domains(domains: list[str] | None) -> list[str]:
+    normalized = []
+    for value in domains or []:
+        domain = value.strip().lower().rstrip(".")
+        if domain.startswith("www."):
+            domain = domain[4:]
+        if _DOMAIN_PATTERN.fullmatch(domain) and domain not in normalized:
+            normalized.append(domain)
+    return normalized[:20]
+
+
+def _domain_matches(hostname: str, domain: str) -> bool:
+    hostname = hostname.lower().rstrip(".")
+    return hostname == domain or hostname.endswith(f".{domain}")
+
+
+def _unwrap_result_url(href: str) -> str:
+    if href.startswith("//"):
+        href = f"https:{href}"
+    parsed = urlparse(href)
+    if parsed.hostname and _domain_matches(parsed.hostname, "duckduckgo.com"):
+        target = parse_qs(parsed.query).get("uddg", [""])[0]
+        if target:
+            return unquote(target)
+    return href
+
+
+def search_web(
+    query: str,
+    max_results: int = 5,
+    allowed_domains: list[str] | None = None,
+    blocked_domains: list[str] | None = None,
+) -> str:
+    """Search the public web without a search API key.
+
+    The contract mirrors the useful part of Claude Code's WebSearch tool: a query,
+    optional domain allow/block lists, and normalized title/URL/snippet results.
+    DuckDuckGo's HTML endpoint is used as a replaceable backend rather than scraped
+    browser JavaScript.
     """
-    payload = {"q": query, "num": max_results}
-    headers = {
-        "X-API-KEY": SERPER_API_KEY,
-        "Content-Type": "application/json",
-    }
+    query = query.strip()
+    if not query:
+        return json.dumps({
+            "error": "query cannot be blank",
+            "query": query,
+        })
+    if len(query) > 500:
+        return json.dumps({"error": "query exceeds 500 characters", "query": query})
+
+    max_results = max(1, min(int(max_results), 10))
+    allowed = _normalize_domains(allowed_domains)
+    blocked = _normalize_domains(blocked_domains)
+    if allowed_domains and not allowed:
+        return json.dumps({
+            "error": "allowed_domains contains no valid domain names",
+            "query": query,
+        })
+    if allowed and blocked:
+        return json.dumps({
+            "error": "allowed_domains and blocked_domains cannot be used together",
+            "query": query,
+        })
+
+    search_query = query
+    if allowed:
+        scopes = " OR ".join(f"site:{domain}" for domain in allowed)
+        search_query = f"{query} ({scopes})"
+    if blocked:
+        search_query += " " + " ".join(f"-site:{domain}" for domain in blocked)
+
     try:
-        resp = httpx.post(
-            f"{SERPER_BASE_URL}/search",
-            json=payload,
-            headers=headers,
-            timeout=15,
+        resp = httpx.get(
+            WEB_SEARCH_URL,
+            params={"q": search_query},
+            headers=_SEARCH_HEADERS,
+            follow_redirects=True,
+            timeout=20,
         )
         resp.raise_for_status()
-        data = resp.json()
     except httpx.HTTPError as e:
-        return json.dumps({"error": str(e)})
+        return json.dumps({"error": str(e), "query": query})
 
+    soup = BeautifulSoup(resp.text, "html.parser")
     results = []
-    for item in data.get("organic", [])[:max_results]:
+    for item in soup.select(".result"):
+        link = item.select_one(".result__a")
+        if link is None:
+            continue
+        url = _unwrap_result_url(str(link.get("href") or ""))
+        parsed = urlparse(url)
+        if parsed.scheme not in {"http", "https"} or not parsed.hostname:
+            continue
+        hostname = parsed.hostname.lower()
+        if allowed and not any(_domain_matches(hostname, domain) for domain in allowed):
+            continue
+        if any(_domain_matches(hostname, domain) for domain in blocked):
+            continue
+        snippet = item.select_one(".result__snippet")
         results.append(
             {
-                "title": item.get("title", ""),
-                "url": item.get("link", ""),
-                "snippet": item.get("snippet", ""),
+                "title": link.get_text(" ", strip=True),
+                "url": url,
+                "snippet": snippet.get_text(" ", strip=True) if snippet else "",
+                "metadata": {"source": "duckduckgo"},
             }
         )
+        if len(results) >= max_results:
+            break
 
-    # Also include knowledgeGraph if present
-    if "knowledgeGraph" in data:
-        kg = data["knowledgeGraph"]
-        results.insert(
-            0,
-            {
-                "title": kg.get("title", ""),
-                "url": kg.get("website", ""),
-                "snippet": kg.get("description", ""),
-                "type": "knowledge_graph",
-            },
+    response: dict[str, object] = {
+        "query": query,
+        "results": results,
+        "total_results": len(results),
+    }
+    if not results:
+        response["warning"] = (
+            "The public search backend returned no results and may be rate-limited."
         )
-
-    return json.dumps(results, ensure_ascii=False)
+    return json.dumps(response, ensure_ascii=False)
 
 
 def search_papers(

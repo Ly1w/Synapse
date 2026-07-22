@@ -2,7 +2,8 @@ from __future__ import annotations
 
 import asyncio
 import logging
-from typing import Any
+from collections import defaultdict
+from typing import Any, Coroutine
 
 from ..communication.message import Message, MessageType
 from ..communication.router import AgentRole, Router
@@ -13,41 +14,38 @@ from ..memory.memory_store import MemoryStore
 from ..memory.plan_cache import PlanCache
 from ..planning.decomposer import TaskDecomposer
 from ..planning.progress import ProgressTracker, TaskProgress, TaskStatus
+from ..runtime.run import RunJournal, RunStatus, redact_state
 from ..skills.generator import SkillsGenerator
 from ..skills.reader import SkillsReader
 from ..tools.registry import ToolRegistry
+from ..tools.mcp_provider import MCPServerConfig, MCPToolProvider
 from .base_agent import BaseAgent
+from .contracts import AgentBudget, AgentOutcome, OutcomeStatus, TaskContract
 from .head_agent import HeadAgent
+from .parsing import extract_json_value
 from .registry import AgentRegistry
 
 logger = logging.getLogger(__name__)
 
+
 MASTER_SYSTEM_PROMPT = """\
-You are the Master Agent in a hierarchical multi-agent system. \
-Users interact only with you.
+You are the Master Agent and global problem owner in a hierarchical multi-agent system.
 
 Your responsibilities:
-1. Decompose user requests into sub-tasks and assign Head Agents.
-2. Receive and aggregate Head Agent reports.
-3. Generate progress reports for the user.
-4. Handle escalations from Heads (e.g., create new Heads when needed).
+1. Interpret the user's evolving requirements and maintain a bounded task graph.
+2. Give each Head an end-to-end contract with scope and acceptance criteria.
+3. Schedule real dependencies, arbitrate cross-Head discoveries, and limit expansion.
+4. Apply user updates while a run is active; decide what must be revised.
+5. Validate coverage and contradictions before committing a response.
 
-You coordinate but do NOT execute tasks directly. \
-Actual work is done by Node Agents under each Head.
-
-{memory_context}
+You do not perform low-level business tool work, but you are responsible for the
+quality and convergence of the complete answer. A final response is a retained
+checkpoint: the run and its agents may be resumed by later user guidance.
 """
 
 
 class MasterAgent(BaseAgent):
-    """
-    Top-level user-facing agent. Decomposes tasks, manages Head agents,
-    tracks progress, and aggregates results.
-
-    Master does not execute tasks or call business tools directly, so it
-    does not need the skills index in its own context. The skills index is
-    generated once and passed down to Node agents via HeadAgents.
-    """
+    """Global owner for interruptible, retained hierarchical runs."""
 
     def __init__(
         self,
@@ -55,54 +53,101 @@ class MasterAgent(BaseAgent):
         tool_registry: ToolRegistry | None = None,
         memory_root: str | None = None,
         cache_dir: str | None = None,
+        run_root: str | None = None,
         max_context_tokens: int = 128000,
+        budget: AgentBudget | None = None,
+        head_budget: AgentBudget | None = None,
+        node_budget: AgentBudget | None = None,
+        retained_run_limit: int | None = 8,
     ):
         config = llm_config or LLMConfig()
         if isinstance(config, FrameworkLLMConfig):
             self._framework_config = config
-            planner_config = config.planner
         else:
             self._framework_config = FrameworkLLMConfig(planner=config)
-            planner_config = config
 
-        llm_client = LLMClient(planner_config)
+        planner_client = LLMClient(self._framework_config.planner)
         self._lightweight_client = LLMClient(self._framework_config.get_lightweight())
         self._executor_client = LLMClient(self._framework_config.get_executor())
-
         self.tool_registry = tool_registry or ToolRegistry()
         self.agent_registry = AgentRegistry()
         self.router = Router()
 
         master_id = AgentRegistry.generate_id("master")
         channel = self.router.register(master_id, AgentRole.MASTER)
-
+        self._memory_root = memory_root
+        self._run_root = run_root
+        self.retained_run_limit = retained_run_limit
         self.memory_store = MemoryStore("master", memory_root)
         self.plan_cache = PlanCache(self._lightweight_client, cache_dir)
         self.skills_generator = SkillsGenerator(self._lightweight_client)
-        self.task_decomposer = TaskDecomposer(llm_client)
-        self.progress_tracker = ProgressTracker()
+        self.task_decomposer = TaskDecomposer(planner_client)
 
-        # Skills index and reader are built after tools are registered.
-        self._skills_index: str = ""
-        self._skills_reader: SkillsReader | None = None
-
-        self._head_tasks: dict[str, asyncio.Task] = {}
-        self._head_results: dict[str, dict[str, Any]] = {}
-        self._head_roles: dict[str, str] = {}
-
-        memory_context = "(Memory loaded at runtime)"
-        system_prompt = MASTER_SYSTEM_PROMPT.format(memory_context=memory_context)
+        self.head_budget = head_budget or AgentBudget(
+            max_turns=20,
+            max_tool_calls=4,
+            max_peer_messages=4,
+            max_discoveries=2,
+            max_children=4,
+            max_revision_rounds=1,
+            timeout_seconds=600,
+        )
+        self.node_budget = node_budget or AgentBudget(
+            max_turns=10,
+            max_tool_calls=10,
+            max_peer_messages=2,
+            max_discoveries=1,
+            max_children=0,
+            max_revision_rounds=0,
+            timeout_seconds=240,
+        )
+        master_budget = budget or AgentBudget(
+            max_turns=30,
+            max_tool_calls=0,
+            max_peer_messages=0,
+            max_discoveries=2,
+            max_children=6,
+            max_revision_rounds=2,
+            timeout_seconds=1800,
+        )
 
         super().__init__(
             agent_id=master_id,
             role="master",
-            system_prompt=system_prompt,
-            llm_client=llm_client,
+            system_prompt=MASTER_SYSTEM_PROMPT,
+            llm_client=planner_client,
             router=self.router,
             channel=channel,
             context_manager=ContextManager(max_tokens=max_context_tokens),
+            budget=master_budget,
         )
         self.agent_registry.register(self, {"role": "master"})
+
+        self._skills_index = ""
+        self._skills_reader: SkillsReader | None = None
+        self._run_journals: dict[str, RunJournal] = {}
+        self._run_tasks: dict[str, asyncio.Task[str]] = {}
+        self._run_updates: dict[str, asyncio.Queue[tuple[int, str]]] = {}
+        self._run_locks: dict[str, asyncio.Lock] = {}
+        self._run_heads: dict[str, dict[str, HeadAgent]] = defaultdict(dict)
+        self._run_head_roles: dict[str, dict[str, str]] = defaultdict(dict)
+        self._run_head_outcomes: dict[str, dict[str, list[AgentOutcome]]] = defaultdict(
+            lambda: defaultdict(list)
+        )
+        self._run_active_head_tasks: dict[
+            str, dict[str, asyncio.Task[AgentOutcome]]
+        ] = defaultdict(dict)
+        self._run_progress: dict[str, ProgressTracker] = {}
+        self._run_discoveries: dict[str, set[str]] = defaultdict(set)
+        self._run_required_revisions: dict[str, dict[str, dict[int, str]]] = defaultdict(
+            lambda: defaultdict(dict)
+        )
+        self._run_revision_attempts: dict[str, dict[tuple[str, int], int]] = defaultdict(dict)
+        self._master_context_states: dict[str, dict[str, Any]] = {}
+        self._run_deferred_contracts: dict[str, list[TaskContract]] = defaultdict(list)
+        self._mcp_providers: list[MCPToolProvider] = []
+        self._cold_run_ids: set[str] = set()
+        self._load_persisted_runs()
 
     async def handle_user_request(
         self,
@@ -110,218 +155,963 @@ class MasterAgent(BaseAgent):
         tools: list[dict[str, Any]] | None = None,
         tool_callables: dict[str, Any] | None = None,
     ) -> str:
-        """
-        Main entry point. Process a user request end-to-end:
-        1. Register tools & generate skills index for Node agents
-        2. Check plan cache
-        3. Decompose into Head agents
-        4. Run all Heads in parallel
-        5. Aggregate results
-        6. Update cache & memory
-        7. Return final result
-        """
-        logger.info("Master handling request: %s", request[:200])
+        """Compatibility wrapper: start an interruptible run and await its checkpoint."""
+        run_id = await self.start_request(request, tools, tool_callables)
+        return await self.wait_for_run(run_id)
 
-        # Initialize memory and plan cache
-        await self.memory_store.initialize()
-        await self.plan_cache.initialize()
+    async def start_request(
+        self,
+        request: str,
+        tools: list[dict[str, Any]] | None = None,
+        tool_callables: dict[str, Any] | None = None,
+    ) -> str:
+        """Start work in the background and return a run id that can be steered."""
+        if any(not task.done() for task in self._run_tasks.values()):
+            raise RuntimeError("This Master already has an active run; steer or await it first.")
+        await self._enforce_retention_limit()
+        journal = RunJournal(request, root_dir=self._run_root)
+        await journal.initialize()
+        await journal.set_status(RunStatus.RUNNING)
+        run_id = journal.run_id
+        self._run_journals[run_id] = journal
+        self._run_updates[run_id] = asyncio.Queue()
+        self._run_locks[run_id] = asyncio.Lock()
+        self._run_tasks[run_id] = asyncio.create_task(
+            self._execute_new_run(run_id, request, tools, tool_callables)
+        )
+        return run_id
 
-        mem = await self.memory_store.read()
-        if mem:
-            self.context.add_pinned(self.memory_store.get_injection_prompt(mem))
+    async def wait_for_run(self, run_id: str) -> str:
+        task = self._run_tasks.get(run_id)
+        if not task:
+            raise KeyError(f"Unknown run: {run_id}")
+        return await asyncio.shield(task)
 
-        # 1. Register tools and generate skills index.
-        #    The index is NOT injected into Master's context — only Node agents need it.
-        if tools:
-            self.tool_registry.register_batch(tools, tool_callables)
-        self._skills_index = await self._generate_skills_index()
-        self._skills_reader = SkillsReader(self._skills_index, self.tool_registry)
-
-        # 2. Check plan cache
-        keyword, cached_entry = await self.plan_cache.lookup(request)
-
-        # 3. Decompose — pass tool categories as a hint (no need to inject full index)
-        tool_categories = list(self.tool_registry.get_categories().keys())
-        if cached_entry:
-            plan = await self.task_decomposer.decompose_from_template(
-                request,
-                cached_entry.template,
-                tool_categories=tool_categories,
+    async def steer(self, run_id: str, user_update: str) -> int:
+        """Apply a user requirement to a running or completed-retained run."""
+        journal = self._run_journals.get(run_id)
+        if not journal:
+            raise KeyError(f"Unknown run: {run_id}")
+        if run_id in self._cold_run_ids:
+            raise RuntimeError(
+                "This Run was loaded as a retained snapshot after restart and is "
+                "inspectable but not resumable. Start a new Run to continue its work."
             )
-        else:
-            plan = await self.task_decomposer.decompose(
-                request,
-                tool_categories=tool_categories,
-            )
+        lock = self._run_locks[run_id]
+        async with lock:
+            status = journal.manifest.status
+            if status == RunStatus.ARCHIVED:
+                raise RuntimeError("Archived runs cannot be steered.")
+            revision = await journal.add_requirement(user_update)
+            await self._run_updates[run_id].put((revision, user_update))
+            if status in {
+                RunStatus.COMPLETED_RETAINED,
+                RunStatus.FAILED_RETAINED,
+                RunStatus.CANCELLED_RETAINED,
+            }:
+                if any(not task.done() for key, task in self._run_tasks.items() if key != run_id):
+                    raise RuntimeError("Another run is active; wait before resuming this run.")
+                await journal.set_status(RunStatus.RUNNING)
+                prior_task = self._run_tasks.get(run_id)
+                if prior_task and not prior_task.done():
+                    self._run_tasks[run_id] = asyncio.create_task(
+                        self._resume_after_prior(run_id, prior_task)
+                    )
+                else:
+                    self._run_tasks[run_id] = asyncio.create_task(self._resume_run(run_id))
+            return revision
 
-        # 4. Initialize progress tracking
-        root_progress = self.progress_tracker.create_root("root", request)
+    async def cancel_run(self, run_id: str) -> None:
+        journal = self._run_journals.get(run_id)
+        task = self._run_tasks.get(run_id)
+        if not journal or not task:
+            raise KeyError(f"Unknown run: {run_id}")
+        if not task.done():
+            task.cancel()
+            await asyncio.gather(task, return_exceptions=True)
+        active = self._run_active_head_tasks.get(run_id, {})
+        items = list(active.items())
+        for _, head_task in items:
+            if not head_task.done():
+                head_task.cancel()
+        results = await asyncio.gather(
+            *(head_task for _, head_task in items),
+            return_exceptions=True,
+        )
+        for (head_id, _), result in zip(items, results):
+            if isinstance(result, AgentOutcome):
+                self._run_head_outcomes[run_id][head_id].append(result)
+        active.clear()
+        await self._retain_master_state(run_id, "Run cancelled by user.")
+        await journal.set_status(RunStatus.CANCELLED_RETAINED)
 
-        # 5. Create and launch Head agents
-        sub_tasks = plan.get("sub_tasks", [])
-        for spec in sub_tasks:
-            await self._create_and_launch_head(spec, root_progress)
+    async def archive_run(self, run_id: str) -> None:
+        """Explicitly release live agents after their snapshots are safely on disk."""
+        journal = self._run_journals.get(run_id)
+        if not journal:
+            raise KeyError(f"Unknown run: {run_id}")
+        task = self._run_tasks.get(run_id)
+        if task and not task.done():
+            raise RuntimeError("Cancel or await the run before archiving it.")
+        for head_id in list(self._run_heads.get(run_id, {})):
+            self.router.unregister_subtree(head_id)
+        for agent_id in list(self.agent_registry.get_all_ids()):
+            if self.agent_registry.get_metadata(agent_id).get("run_id") == run_id:
+                self.agent_registry.unregister(agent_id)
+        self._run_heads.pop(run_id, None)
+        await journal.set_status(RunStatus.ARCHIVED)
 
-        # 6. Monitor heads: collect reports and handle escalations
-        expected = len(self._head_tasks)
-        completed = 0
+    async def get_run_state(self, run_id: str) -> dict[str, Any]:
+        journal = self._run_journals.get(run_id)
+        if not journal:
+            raise KeyError(f"Unknown run: {run_id}")
+        state = await journal.read_state()
+        interrupted = run_id in self._cold_run_ids and state["status"] == RunStatus.RUNNING.value
+        if interrupted:
+            state["status"] = RunStatus.FAILED_RETAINED.value
+        state["storage_path"] = str(journal.run_dir)
+        state["live_agents"] = [
+            agent_id for agent_id in journal.manifest.agent_ids
+            if self.agent_registry.get(agent_id) is not None
+        ]
+        state["progress"] = await self.get_progress_report(run_id)
+        state["topology"] = await self._build_run_topology(run_id)
+        state["topology"]["master"]["status"] = state["status"]
+        state["resumable"] = (
+            run_id not in self._cold_run_ids
+            and state["status"] != RunStatus.ARCHIVED.value
+        )
+        state["retention"] = "snapshot" if run_id in self._cold_run_ids else "live"
+        state["interrupted"] = interrupted
+        return state
 
-        while completed < expected:
-            msg = await self.receive_message(timeout=3.0)
-            if msg is None:
-                continue
+    async def list_run_states(self) -> list[dict[str, Any]]:
+        states = [await self.get_run_state(run_id) for run_id in self._run_journals]
+        states.sort(key=lambda item: float(item.get("created_at", 0)), reverse=True)
+        return states
 
-            if msg.msg_type == MessageType.REPORT:
-                agent_id = msg.content.get("agent_id", msg.sender_id)
-                self._head_results[agent_id] = msg.content
-                completed += 1
-                self.progress_tracker.update_status(
-                    agent_id, TaskStatus.COMPLETED,
-                    msg.content.get("text", "")[:300],
-                )
-                logger.info("Master: head %s reported (%d/%d)",
-                            agent_id, completed, expected)
+    def get_runtime_info(self) -> dict[str, str]:
+        """Return non-secret model routing metadata for control-plane clients."""
+        return {
+            "planner_model": self._framework_config.planner.model,
+            "executor_model": self._framework_config.get_executor().model,
+            "lightweight_model": self._framework_config.get_lightweight().model,
+            "base_url": self._framework_config.planner.base_url,
+        }
 
-            elif msg.msg_type == MessageType.ESCALATION:
-                new_head = await self._handle_escalation(msg, root_progress)
-                if new_head:
-                    expected += 1
+    def get_mcp_status(self) -> list[dict[str, Any]]:
+        return [provider.status() for provider in self._mcp_providers]
 
-            elif msg.msg_type == MessageType.PROGRESS:
-                self.progress_tracker.update_status(
-                    msg.sender_id, TaskStatus.IN_PROGRESS,
-                    msg.content.get("text", ""),
-                )
+    async def connect_mcp_server(self, config: MCPServerConfig) -> list[str]:
+        """Connect one MCP server and make its allowed tools available to Nodes."""
+        provider = MCPToolProvider(config)
+        names = await provider.connect(self.tool_registry)
+        self._mcp_providers.append(provider)
+        return names
 
-        # Wait for all head tasks
-        if self._head_tasks:
-            await asyncio.gather(*self._head_tasks.values(), return_exceptions=True)
-
-        # 7. Aggregate final results
-        final_result = await self._aggregate_final_results(request)
-
-        # 8. Update plan cache and memory
-        if keyword:
-            execution_log = self.progress_tracker.to_execution_log()
-            await self.plan_cache.store(keyword, execution_log)
-
-        await self.memory_store.append(
-            f"## Request: {request[:100]}\n"
-            f"Strategy: {plan.get('overall_strategy', 'N/A')}\n"
-            f"Heads: {len(sub_tasks)}, Result: {final_result[:200]}\n"
+    async def close_mcp_servers(self) -> None:
+        providers = list(reversed(self._mcp_providers))
+        self._mcp_providers.clear()
+        await asyncio.gather(
+            *(provider.close() for provider in providers),
+            return_exceptions=True,
         )
 
-        logger.info("Master completed request")
-        return final_result
-
-    async def get_progress_report(self) -> str:
-        """Generate a formatted progress report for the user."""
-        return self.progress_tracker.generate_report()
-
-    async def _generate_skills_index(self) -> str:
-        """Generate the lightweight skills index from registered tools."""
-        if not self.tool_registry.get_all():
-            return ""
-        return await self.skills_generator.generate_index(self.tool_registry)
-
-    async def _create_and_launch_head(
+    async def get_run_events(
         self,
-        spec: dict[str, Any],
+        run_id: str,
+        after_sequence: int = 0,
+        limit: int = 500,
+    ) -> list[dict[str, Any]]:
+        journal = self._run_journals.get(run_id)
+        if not journal:
+            raise KeyError(f"Unknown run: {run_id}")
+        return await journal.read_events(after_sequence, limit)
+
+    async def get_agent_snapshot(
+        self,
+        run_id: str,
+        agent_id: str,
+    ) -> dict[str, Any] | None:
+        journal = self._run_journals.get(run_id)
+        if not journal:
+            raise KeyError(f"Unknown run: {run_id}")
+        agent = self.agent_registry.get(agent_id)
+        is_current_master = (
+            agent_id == self.id
+            and self.run_id == run_id
+            and journal.manifest.status != RunStatus.ARCHIVED
+        )
+        is_run_agent = self.agent_registry.get_metadata(agent_id).get("run_id") == run_id
+        if agent is not None and (is_current_master or is_run_agent):
+            return redact_state(agent.export_state())
+        return await journal.read_agent_snapshot(agent_id)
+
+    async def get_progress_report(self, run_id: str | None = None) -> str:
+        if run_id is None:
+            if not self._run_progress:
+                return "No tasks tracked."
+            run_id = next(reversed(self._run_progress))
+        tracker = self._run_progress.get(run_id)
+        return tracker.generate_report() if tracker else "No tasks tracked."
+
+    async def _execute_new_run(
+        self,
+        run_id: str,
+        request: str,
+        tools: list[dict[str, Any]] | None,
+        tool_callables: dict[str, Any] | None,
+    ) -> str:
+        journal = self._run_journals[run_id]
+        try:
+            await self._activate_master_context(run_id, fresh=True)
+            await journal.register_agent(self.id, "master")
+            await self.memory_store.initialize()
+            await self.plan_cache.initialize()
+            memory = await self.memory_store.read()
+            if memory:
+                self.context.add_pinned(self.memory_store.get_injection_prompt(memory))
+
+            if tools:
+                self.tool_registry.register_batch(tools, tool_callables)
+            self._skills_index = await self._generate_skills_index()
+            self._skills_reader = (
+                SkillsReader(self._skills_index, self.tool_registry, self._lightweight_client)
+                if self._skills_index else None
+            )
+
+            keyword, cached_entry = await self.plan_cache.lookup(request)
+            tool_categories = list(self.tool_registry.get_categories())
+            if cached_entry:
+                plan = await self.task_decomposer.decompose_from_template(
+                    request, cached_entry.template, tool_categories
+                )
+            else:
+                plan = await self.task_decomposer.decompose(request, tool_categories)
+
+            tracker = ProgressTracker()
+            root_progress = tracker.create_root(run_id, request)
+            root_progress.mark_in_progress()
+            self._run_progress[run_id] = tracker
+            pending = self._contracts_from_plan(plan)
+            active: dict[str, asyncio.Task[AgentOutcome]] = {}
+            self._run_active_head_tasks[run_id] = active
+
+            final = await self._drive_and_commit(
+                run_id, request, pending, active, root_progress
+            )
+            outcomes = self._latest_outcomes(run_id)
+            if outcomes and all(item.successful for item in outcomes):
+                await self._post_run_learning(
+                    keyword,
+                    tracker.to_execution_log(),
+                    request,
+                    str(plan.get("overall_strategy", "N/A")),
+                    final,
+                )
+            return final
+        except asyncio.CancelledError:
+            await journal.set_status(RunStatus.CANCELLED_RETAINED)
+            raise
+        except Exception as exc:
+            logger.exception("Run %s failed", run_id)
+            result = f"Run failed, but its state was retained: {exc}"
+            await self._retain_master_state(run_id, result)
+            await journal.set_status(RunStatus.FAILED_RETAINED, result)
+            return result
+
+    async def _resume_run(self, run_id: str) -> str:
+        journal = self._run_journals[run_id]
+        try:
+            await self._activate_master_context(run_id, fresh=False)
+            tracker = self._run_progress.get(run_id) or ProgressTracker()
+            if tracker.root is None:
+                tracker.create_root(run_id, journal.manifest.user_request).mark_in_progress()
+            self._run_progress[run_id] = tracker
+            return await self._drive_and_commit(
+                run_id,
+                journal.manifest.user_request,
+                pending={},
+                active=self._new_active_task_map(run_id),
+                root_progress=tracker.root,
+            )
+        except asyncio.CancelledError:
+            await journal.set_status(RunStatus.CANCELLED_RETAINED)
+            raise
+        except Exception as exc:
+            logger.exception("Retained run %s failed to resume", run_id)
+            result = f"Run revision failed, but prior state remains retained: {exc}"
+            await self._retain_master_state(run_id, result)
+            await journal.set_status(RunStatus.FAILED_RETAINED, result)
+            return result
+
+    async def _resume_after_prior(
+        self,
+        run_id: str,
+        prior_task: asyncio.Task[str],
+    ) -> str:
+        await asyncio.shield(prior_task)
+        return await self._resume_run(run_id)
+
+    async def _drive_and_commit(
+        self,
+        run_id: str,
+        original_request: str,
+        pending: dict[str, TaskContract],
+        active: dict[str, asyncio.Task[AgentOutcome]],
+        root_progress: TaskProgress,
+    ) -> str:
+        journal = self._run_journals[run_id]
+        while True:
+            await self._drive_scheduler(run_id, pending, active, root_progress)
+            candidate = await self._aggregate_final_results(run_id, original_request)
+
+            # Committing and accepting a new steering event are serialized.  An update
+            # either changes this checkpoint or starts a retained revision afterwards.
+            lock = self._run_locks[run_id]
+            async with lock:
+                if not self._run_updates[run_id].empty():
+                    continue
+                root_progress.mark_completed(candidate[:300])
+                await self._retain_master_state(run_id, candidate)
+                await journal.set_status(RunStatus.COMPLETED_RETAINED, candidate)
+                return candidate
+
+    async def _drive_scheduler(
+        self,
+        run_id: str,
+        pending: dict[str, TaskContract],
+        active: dict[str, asyncio.Task[AgentOutcome]],
+        root_progress: TaskProgress,
+    ) -> None:
+        while pending or active or not self._run_updates[run_id].empty():
+            if self.remaining_seconds <= 0:
+                self._run_deferred_contracts[run_id].extend(pending.values())
+                pending.clear()
+                items = list(active.items())
+                for _, task in items:
+                    if not task.done():
+                        task.cancel()
+                results = await asyncio.gather(
+                    *(task for _, task in items),
+                    return_exceptions=True,
+                )
+                for (head_id, _), result in zip(items, results):
+                    if isinstance(result, AgentOutcome):
+                        self._run_head_outcomes[run_id][head_id].append(result)
+                        self._run_progress[run_id].update_status(
+                            head_id, TaskStatus.FAILED, result.summary[:300]
+                        )
+                active.clear()
+                await self.record_event("master_budget_exhausted", {
+                    "timeout_seconds": self.budget.timeout_seconds,
+                })
+                return
+            await self._apply_queued_updates(run_id, pending, active, root_progress)
+            latest_by_role = self._latest_outcomes_by_role(run_id)
+            ready = [
+                role for role, contract in pending.items()
+                if set(contract.dependencies).issubset(latest_by_role)
+            ]
+            available = max(0, self.budget.max_children - len(self._run_heads[run_id]))
+            for role in ready[:available]:
+                contract = pending.pop(role)
+                contract.context["dependency_outcomes"] = {
+                    dep: latest_by_role[dep].model_dump(mode="json")
+                    for dep in contract.dependencies
+                }
+                head = await self._create_head(run_id, contract, root_progress)
+                active[head.id] = asyncio.create_task(
+                    self._run_head_guarded(head, head.run())
+                )
+
+            if pending and not active and not ready:
+                # A malformed dependency cycle must degrade explicitly, never deadlock.
+                role, contract = pending.popitem()
+                contract.context["dependency_warning"] = (
+                    f"Unresolved or cyclic dependencies: {contract.dependencies}"
+                )
+                head = await self._create_head(run_id, contract, root_progress)
+                active[head.id] = asyncio.create_task(
+                    self._run_head_guarded(head, head.run())
+                )
+
+            if pending and not active and available == 0:
+                self._run_deferred_contracts[run_id].extend(pending.values())
+                await self.record_event("head_budget_exhausted", {
+                    "deferred_contracts": [
+                        contract.model_dump(mode="json") for contract in pending.values()
+                    ]
+                })
+                pending.clear()
+
+            if active:
+                message = await self.receive_message(timeout=0.25)
+                if message:
+                    await self._handle_master_message(
+                        run_id, message, pending, active, root_progress
+                    )
+            elif pending:
+                await asyncio.sleep(0)
+
+            for head_id, task in list(active.items()):
+                if not task.done():
+                    continue
+                head = self._run_heads[run_id][head_id]
+                try:
+                    outcome = task.result()
+                except Exception as exc:
+                    outcome = AgentOutcome(
+                        agent_id=head_id,
+                        task_id=head.contract.task_id,
+                        status=OutcomeStatus.FAILED,
+                        summary=f"Uncaught Head failure: {exc}",
+                        unresolved=[head.contract.goal],
+                    )
+                self._run_head_outcomes[run_id][head_id].append(outcome)
+                applied = set(outcome.metadata.get("applied_revisions", []))
+                required = self._run_required_revisions[run_id].get(head_id, {})
+                missing = [
+                    revision for revision in required
+                    if revision not in applied
+                    and self._run_revision_attempts[run_id].get((head_id, revision), 0) < 1
+                ]
+                if missing:
+                    for revision in missing:
+                        key = (head_id, revision)
+                        self._run_revision_attempts[run_id][key] = (
+                            self._run_revision_attempts[run_id].get(key, 0) + 1
+                        )
+                    guidance = "\n".join(
+                        f"Revision {revision}: {required[revision]}" for revision in missing
+                    )
+                    active[head_id] = asyncio.create_task(
+                        self._run_head_guarded(head, head.resume(guidance, missing))
+                    )
+                    self._run_progress[run_id].update_status(
+                        head_id,
+                        TaskStatus.IN_PROGRESS,
+                        f"Applying revisions {missing}",
+                    )
+                    continue
+                status = TaskStatus.COMPLETED if outcome.status in {
+                    OutcomeStatus.COMPLETED, OutcomeStatus.PARTIAL
+                } else TaskStatus.FAILED
+                self._run_progress[run_id].update_status(head_id, status, outcome.summary[:300])
+                del active[head_id]
+
+    async def _run_head_guarded(
+        self,
+        head: HeadAgent,
+        coroutine: Coroutine[Any, Any, AgentOutcome],
+    ) -> AgentOutcome:
+        try:
+            return await asyncio.wait_for(coroutine, timeout=head.budget.timeout_seconds)
+        except asyncio.TimeoutError:
+            head.stop()
+            outcome = AgentOutcome(
+                agent_id=head.id,
+                task_id=head.contract.task_id,
+                status=OutcomeStatus.PARTIAL,
+                summary="Head timed out; all agent state was retained.",
+                unresolved=[head.contract.goal],
+                metadata={"timeout_seconds": head.budget.timeout_seconds},
+            )
+        except asyncio.CancelledError:
+            head.stop()
+            outcome = AgentOutcome(
+                agent_id=head.id,
+                task_id=head.contract.task_id,
+                status=OutcomeStatus.CANCELLED,
+                summary="Head cancelled by Master.",
+                unresolved=[head.contract.goal],
+            )
+        except Exception as exc:
+            logger.exception("Head task %s crashed", head.id)
+            outcome = AgentOutcome(
+                agent_id=head.id,
+                task_id=head.contract.task_id,
+                status=OutcomeStatus.FAILED,
+                summary=f"Head crashed: {exc}",
+                unresolved=[head.contract.goal],
+            )
+        if head.journal:
+            await head.journal.snapshot_agent(
+                head,
+                {
+                    "contract": head.contract.model_dump(mode="json"),
+                    "outcome": outcome.model_dump(mode="json"),
+                },
+            )
+        return outcome
+
+    async def _apply_queued_updates(
+        self,
+        run_id: str,
+        pending: dict[str, TaskContract],
+        active: dict[str, asyncio.Task[AgentOutcome]],
+        root_progress: TaskProgress,
+    ) -> None:
+        queue = self._run_updates[run_id]
+        while not queue.empty():
+            revision, update = queue.get_nowait()
+            await self._apply_user_update(
+                run_id, revision, update, pending, active, root_progress
+            )
+
+    async def _apply_user_update(
+        self,
+        run_id: str,
+        revision: int,
+        update: str,
+        pending: dict[str, TaskContract],
+        active: dict[str, asyncio.Task[AgentOutcome]],
+        root_progress: TaskProgress,
+    ) -> None:
+        roles = self._run_head_roles[run_id]
+        self.context.add_message({
+            "role": "user",
+            "content": f"[User update revision {revision}] {update}",
+        })
+        raw = await self.think(
+            f"A user changed requirements during run {run_id}.\n"
+            f"Update: {update}\n"
+            f"Heads: {roles}\nPending roles: {list(pending)}\n"
+            "Return JSON with action=master_only|broadcast|target|add_head, "
+            "target_roles, guidance, and optional new_head contract. Preserve completed "
+            "work unless the update invalidates it."
+        )
+        decision = extract_json_value(raw, dict) or {
+            "action": "broadcast",
+            "target_roles": list(roles.values()),
+            "guidance": update,
+        }
+        action = str(decision.get("action", "broadcast"))
+        guidance = str(decision.get("guidance") or update)
+        target_roles = decision.get("target_roles", [])
+        if not isinstance(target_roles, list):
+            target_roles = []
+        if action == "broadcast":
+            target_ids = list(self._run_heads[run_id])
+        else:
+            wanted = {str(role) for role in target_roles}
+            target_ids = [
+                head_id for head_id, role in roles.items()
+                if role in wanted or head_id in wanted
+            ]
+
+        if action != "master_only":
+            for contract in pending.values():
+                if action == "broadcast" or contract.role in target_roles:
+                    contract.context[f"user_revision_{revision}"] = guidance
+
+            for head_id in target_ids:
+                head = self._run_heads[run_id][head_id]
+                self._run_required_revisions[run_id][head_id][revision] = guidance
+                if head_id in active:
+                    await self.send_message(
+                        head_id,
+                        MessageType.GUIDANCE,
+                        {"text": guidance, "revision": revision},
+                    )
+                else:
+                    active[head_id] = asyncio.create_task(
+                        self._run_head_guarded(head, head.resume(guidance, revision))
+                    )
+                    self._run_progress[run_id].update_status(
+                        head_id, TaskStatus.IN_PROGRESS, f"Applying revision {revision}"
+                    )
+
+        if action == "add_head" and len(self._run_heads[run_id]) < self.budget.max_children:
+            spec = decision.get("new_head")
+            if isinstance(spec, dict):
+                contract = self._contract_from_spec(spec)
+                contract.context[f"user_revision_{revision}"] = update
+                contract.role = self._unique_role(run_id, contract.role, pending)
+                pending[contract.role] = contract
+        await self.record_event("user_update_applied", {
+            "revision": revision,
+            "update": update,
+            "decision": decision,
+        })
+
+    async def _handle_master_message(
+        self,
+        run_id: str,
+        message: Message,
+        pending: dict[str, TaskContract],
+        active: dict[str, asyncio.Task[AgentOutcome]],
+        root_progress: TaskProgress,
+    ) -> None:
+        if message.msg_type == MessageType.DISCOVERY:
+            await self._handle_head_discovery(
+                run_id, message, pending, active, root_progress
+            )
+        elif message.msg_type == MessageType.PROGRESS:
+            self._run_progress[run_id].update_status(
+                message.sender_id,
+                TaskStatus.IN_PROGRESS,
+                str(message.content.get("text", "")),
+            )
+        # REPORT does not control completion. The task result is authoritative.
+
+    async def _handle_head_discovery(
+        self,
+        run_id: str,
+        message: Message,
+        pending: dict[str, TaskContract],
+        active: dict[str, asyncio.Task[AgentOutcome]],
+        root_progress: TaskProgress,
+    ) -> None:
+        description = str(message.content.get("description") or message.content.get("text") or "")
+        fingerprint = " ".join(description.lower().split())[:300]
+        seen = self._run_discoveries[run_id]
+        if not fingerprint or fingerprint in seen:
+            return
+        seen.add(fingerprint)
+        if len(seen) > self.budget.max_discoveries:
+            await self.record_event("discovery_deferred", message.content, target=message.sender_id)
+            return
+
+        raw = await self.think(
+            f"A Head reported an out-of-contract discovery: {message.content}\n"
+            f"Current Head roles: {self._run_head_roles[run_id]}\n"
+            "Return JSON with action=assign_existing|create_head|defer, reason, "
+            "target_agent_id, guidance, and optional new_head contract. Expansion is a last resort."
+        )
+        decision = extract_json_value(raw, dict) or {"action": "defer", "reason": raw}
+        action = str(decision.get("action", "defer"))
+        if action == "assign_existing":
+            target = str(decision.get("target_agent_id", ""))
+            if target in self._run_heads[run_id]:
+                guidance = str(decision.get("guidance") or description)
+                head = self._run_heads[run_id][target]
+                if target in active:
+                    await self.send_message(target, MessageType.GUIDANCE, {"text": guidance})
+                else:
+                    active[target] = asyncio.create_task(
+                        self._run_head_guarded(head, head.resume(guidance))
+                    )
+        elif action == "create_head" and len(self._run_heads[run_id]) < self.budget.max_children:
+            spec = decision.get("new_head")
+            if isinstance(spec, dict):
+                contract = self._contract_from_spec(spec)
+                contract.context["discovery"] = message.content
+                contract.role = self._unique_role(run_id, contract.role, pending)
+                pending[contract.role] = contract
+        await self.record_event("head_discovery_triaged", {
+            "discovery": message.content,
+            "decision": decision,
+        })
+
+    async def _create_head(
+        self,
+        run_id: str,
+        contract: TaskContract,
         parent_progress: TaskProgress,
     ) -> HeadAgent:
-        """Create a HeadAgent, register it, and launch as async task."""
-        role = spec.get("role", "general")
-        task = spec.get("description", spec.get("task", ""))
         head_id = AgentRegistry.generate_id("head")
-
-        peer_roster = self._build_peer_roster(head_id)
-        channel = self.router.register(head_id, AgentRole.HEAD, parent_id=self.id)
-
+        channel = self.router.register(
+            head_id,
+            AgentRole.HEAD,
+            parent_id=self.id,
+            run_id=run_id,
+        )
+        self._run_head_roles[run_id][head_id] = contract.role
         head = HeadAgent(
             agent_id=head_id,
-            role=role,
-            task=task,
+            role=contract.role,
+            task=contract.goal,
             master_id=self.id,
-            llm_client=self._executor_client,
+            llm_client=self.llm_client,
+            node_llm_client=self._executor_client,
             router=self.router,
             channel=channel,
             tool_registry=self.tool_registry,
             agent_registry=self.agent_registry,
             skills_reader=self._skills_reader,
-            peer_roster=peer_roster,
-            memory_store=MemoryStore(f"head-{role}"),
+            peer_roster=self._build_peer_roster(run_id, head_id),
+            memory_store=MemoryStore(f"head-{contract.role}", self._memory_root),
+            contract=contract,
+            budget=self.head_budget.model_copy(deep=True),
+            child_budget=self.node_budget.model_copy(deep=True),
+            run_id=run_id,
+            journal=self._run_journals[run_id],
         )
-        self.agent_registry.register(head, {"role": role, "task": task})
-        self._head_roles[head_id] = f"{role}: {task}"
-
-        await self._update_all_peer_rosters()
-
-        task_progress = TaskProgress(
+        self.agent_registry.register(head, {
+            "role": contract.role,
+            "task": contract.goal,
+            "run_id": run_id,
+            "parent_id": self.id,
+        })
+        self._run_heads[run_id][head_id] = head
+        await self._run_journals[run_id].register_agent(head_id, contract.role, self.id)
+        self._update_all_peer_rosters(run_id)
+        parent_progress.add_sub_task(TaskProgress(
             task_id=head_id,
-            description=task,
+            description=contract.goal,
             status=TaskStatus.IN_PROGRESS,
             assigned_to=head_id,
-        )
-        parent_progress.add_sub_task(task_progress)
-
-        self._head_tasks[head_id] = asyncio.create_task(head.run())
-        logger.info("Master: created head %s (role=%s)", head_id, role)
+        ))
         return head
 
-    def _build_peer_roster(self, exclude_id: str) -> str:
-        """Build a text roster of all active Head agents."""
-        lines: list[str] = []
-        for hid, role_desc in self._head_roles.items():
-            if hid != exclude_id:
-                lines.append(f"- {hid}: {role_desc}")
+    def _build_peer_roster(self, run_id: str, exclude_id: str) -> str:
+        lines = [
+            f"- {head_id}: {role}: {self._run_heads[run_id][head_id].contract.goal}"
+            for head_id, role in self._run_head_roles[run_id].items()
+            if head_id != exclude_id and head_id in self._run_heads[run_id]
+        ]
         return "\n".join(lines) if lines else "No peers yet."
 
-    async def _update_all_peer_rosters(self) -> None:
-        """Update peer rosters for all existing heads (called when a new head is added)."""
-        for hid in self._head_roles:
-            head = self.agent_registry.get(hid)
-            if head and isinstance(head, HeadAgent):
-                head.peer_roster_text = self._build_peer_roster(hid)
+    def _update_all_peer_rosters(self, run_id: str) -> None:
+        for head_id, head in self._run_heads[run_id].items():
+            head.update_peer_roster(self._build_peer_roster(run_id, head_id))
 
-    async def _handle_escalation(
+    async def _aggregate_final_results(self, run_id: str, original_request: str) -> str:
+        latest = self._latest_outcomes(run_id)
+        requirements = self._run_journals[run_id].manifest.requirements
+        results = [item.model_dump(mode="json") for item in latest]
+        deferred = [
+            contract.model_dump(mode="json")
+            for contract in self._run_deferred_contracts[run_id]
+        ]
+        results_for_prompt: Any = results or (
+            "No Head result was available; provide the best reasoned response and explain the gap."
+        )
+        return await self.think(
+            "Produce the Master checkpoint for the user. Verify coverage against every "
+            "requirement, resolve contradictions between Heads, and disclose remaining gaps. "
+            "Do not concatenate reports.\n\n"
+            f"Original request: {original_request}\n"
+            f"Current requirements: {requirements}\n"
+            f"Head outcomes: {results_for_prompt}\n"
+            f"Deferred contracts caused by the hard Head budget: {deferred}\n"
+            f"Progress:\n{await self.get_progress_report(run_id)}"
+        )
+
+    def _contracts_from_plan(self, plan: dict[str, Any]) -> dict[str, TaskContract]:
+        pending: dict[str, TaskContract] = {}
+        for spec in plan.get("sub_tasks", [])[:4]:
+            if not isinstance(spec, dict):
+                continue
+            contract = self._contract_from_spec(spec)
+            contract.role = self._unique_role("", contract.role, pending)
+            pending[contract.role] = contract
+        return pending
+
+    @staticmethod
+    def _contract_from_spec(spec: dict[str, Any]) -> TaskContract:
+        goal = str(spec.get("description") or spec.get("goal") or spec.get("task") or "")
+        return TaskContract(
+            role=str(spec.get("role") or "general_owner"),
+            goal=goal or "Complete the assigned part of the request",
+            scope=str(spec.get("scope") or goal),
+            deliverable=str(spec.get("expected_output") or spec.get("deliverable") or "Task result"),
+            acceptance_criteria=[str(item) for item in spec.get("acceptance_criteria", [])],
+            dependencies=[str(item) for item in spec.get("dependencies", [])],
+        )
+
+    def _unique_role(
         self,
-        msg: Message,
-        parent_progress: TaskProgress,
-    ) -> HeadAgent | None:
-        """Handle escalation from a Head: potentially create a new Head."""
-        desc = msg.content.get("text", "")
-        source = msg.content.get("source_head", msg.sender_id)
-        logger.info("Master: escalation from %s: %s", source, desc[:100])
+        run_id: str,
+        base_role: str,
+        pending: dict[str, TaskContract],
+    ) -> str:
+        used = set(pending)
+        if run_id:
+            used.update(self._run_head_roles[run_id].values())
+        role = base_role
+        suffix = 2
+        while role in used:
+            role = f"{base_role}_{suffix}"
+            suffix += 1
+        return role
 
-        decision = await self.think(
-            f"A Head Agent ({source}) escalated: '{desc}'. "
-            f"Current heads: {list(self._head_roles.values())}. "
-            f"Should I create a new Head Agent for this? "
-            f"Reply YES with a role and task, or NO if an existing head can handle it."
+    def _latest_outcomes(self, run_id: str) -> list[AgentOutcome]:
+        return [
+            outcomes[-1]
+            for outcomes in self._run_head_outcomes[run_id].values()
+            if outcomes
+        ]
+
+    def _latest_outcomes_by_role(self, run_id: str) -> dict[str, AgentOutcome]:
+        result: dict[str, AgentOutcome] = {}
+        for head_id, outcomes in self._run_head_outcomes[run_id].items():
+            if outcomes:
+                result[self._run_head_roles[run_id][head_id]] = outcomes[-1]
+        return result
+
+    async def _build_run_topology(self, run_id: str) -> dict[str, Any]:
+        active = self._run_active_head_tasks.get(run_id, {})
+        heads = []
+        for head_id, head in self._run_heads.get(run_id, {}).items():
+            outcomes = self._run_head_outcomes[run_id].get(head_id, [])
+            latest = outcomes[-1].model_dump(mode="json") if outcomes else None
+            head_status = "running" if head_id in active else (
+                latest["status"] if latest else "retained"
+            )
+            nodes = []
+            for node_id, node in head._node_agents.items():
+                node_outcomes = head._node_outcomes.get(node_id, [])
+                node_latest = (
+                    node_outcomes[-1].model_dump(mode="json")
+                    if node_outcomes else None
+                )
+                node_status = "running" if node_id in head._node_tasks else (
+                    node_latest["status"] if node_latest else "retained"
+                )
+                nodes.append({
+                    "agent_id": node_id,
+                    "role": node.role,
+                    "goal": node.contract.goal,
+                    "status": node_status,
+                    "outcome": node_latest,
+                })
+            heads.append({
+                "agent_id": head_id,
+                "role": head.role,
+                "goal": head.contract.goal,
+                "status": head_status,
+                "outcome": latest,
+                "nodes": nodes,
+            })
+        if not heads:
+            return await self._build_snapshot_topology(run_id)
+        return {
+            "master": {
+                "agent_id": self.id,
+                "role": "master",
+                "status": self._run_journals[run_id].manifest.status.value,
+            },
+            "heads": heads,
+        }
+
+    async def _build_snapshot_topology(self, run_id: str) -> dict[str, Any]:
+        journal = self._run_journals[run_id]
+        snapshots: dict[str, dict[str, Any]] = {}
+        for agent_id in journal.manifest.agent_ids:
+            snapshot = await journal.read_agent_snapshot(agent_id)
+            if snapshot:
+                snapshots[agent_id] = snapshot
+
+        master_snapshot = next(
+            (item for item in snapshots.values() if item.get("role") == "master"),
+            {},
+        )
+        head_ids = master_snapshot.get("head_ids") or [
+            agent_id for agent_id, item in snapshots.items()
+            if "node_ids" in item and item.get("role") != "master"
+        ]
+        heads = []
+        for head_id in head_ids:
+            head = snapshots.get(head_id, {})
+            contract = head.get("contract") or {}
+            outcome = head.get("outcome") or {}
+            nodes = []
+            for node_id in head.get("node_ids") or []:
+                node = snapshots.get(node_id, {})
+                node_contract = node.get("contract") or {}
+                node_outcome = node.get("outcome") or {}
+                nodes.append({
+                    "agent_id": node_id,
+                    "role": node.get("role", "node"),
+                    "goal": node_contract.get("goal", "Retained Node snapshot"),
+                    "status": node_outcome.get("status", "retained"),
+                    "outcome": node_outcome or None,
+                })
+            heads.append({
+                "agent_id": head_id,
+                "role": head.get("role", "head"),
+                "goal": contract.get("goal", "Retained Head snapshot"),
+                "status": outcome.get("status", "retained"),
+                "outcome": outcome or None,
+                "nodes": nodes,
+            })
+
+        return {
+            "master": {
+                "agent_id": master_snapshot.get("agent_id", self.id),
+                "role": "master",
+                "status": journal.manifest.status.value,
+            },
+            "heads": heads,
+        }
+
+    def _load_persisted_runs(self) -> None:
+        """Expose prior journals as read-only cold snapshots after process restart."""
+        for journal in RunJournal.discover(self._run_root):
+            run_id = journal.run_id
+            self._run_journals[run_id] = journal
+            self._run_updates[run_id] = asyncio.Queue()
+            self._run_locks[run_id] = asyncio.Lock()
+            self._cold_run_ids.add(run_id)
+
+    async def _generate_skills_index(self) -> str:
+        if not self.tool_registry.get_all():
+            return ""
+        try:
+            return await self.skills_generator.generate(self.tool_registry)
+        except Exception:
+            logger.exception("Skills index generation failed; using deterministic fallback")
+            return self.skills_generator.generate_fallback(self.tool_registry)
+
+    async def _activate_master_context(self, run_id: str, fresh: bool) -> None:
+        self.journal = self._run_journals[run_id]
+        self.run_id = run_id
+        self.task_id = run_id
+        self._sent_counts.clear()
+        if fresh:
+            self.context.clear_messages()
+            self.context.clear_pinned()
+        elif run_id in self._master_context_states:
+            self.context.restore_state(self._master_context_states[run_id])
+        self.start_clock()
+
+    async def _retain_master_state(self, run_id: str, final_response: str) -> None:
+        self._master_context_states[run_id] = self.context.export_state()
+        await self._run_journals[run_id].snapshot_agent(
+            self,
+            {
+                "final_response": final_response,
+                "head_ids": list(self._run_heads[run_id]),
+            },
         )
 
-        if "YES" in decision.upper():
-            spec = {"role": "escalated", "description": desc}
-            return await self._create_and_launch_head(spec, parent_progress)
-        return None
+    async def _post_run_learning(
+        self,
+        keyword: str | None,
+        execution_log: str,
+        request: str,
+        strategy: str,
+        final: str,
+    ) -> None:
+        try:
+            if keyword:
+                await self.plan_cache.store(keyword, execution_log)
+            await self.memory_store.append(
+                f"## Request: {request[:120]}\n"
+                f"Strategy: {strategy}\n"
+                f"Result: {final[:500]}\n"
+            )
+        except Exception:
+            logger.exception("Post-run learning failed")
 
-    async def _aggregate_final_results(self, original_request: str) -> str:
-        """Aggregate all Head reports into a final response."""
-        if not self._head_results:
-            return "No results available."
+    def _new_active_task_map(self, run_id: str) -> dict[str, asyncio.Task[AgentOutcome]]:
+        active: dict[str, asyncio.Task[AgentOutcome]] = {}
+        self._run_active_head_tasks[run_id] = active
+        return active
 
-        results_text = "\n\n".join(
-            f"Head {hid} ({self._head_roles.get(hid, '?')}): "
-            f"{res.get('text', str(res))}"
-            for hid, res in self._head_results.items()
-        )
-
-        final = await self.think(
-            f"Aggregate these Head Agent reports into a final response "
-            f"for the user.\n\n"
-            f"Original request: {original_request}\n\n"
-            f"Head reports:\n{results_text}\n\n"
-            f"Progress:\n{self.progress_tracker.generate_report()}\n\n"
-            f"Provide a clear, comprehensive response to the user."
-        )
-        return final
+    async def _enforce_retention_limit(self) -> None:
+        if self.retained_run_limit is None or self.retained_run_limit < 1:
+            return
+        retained = [
+            journal for journal in self._run_journals.values()
+            if journal.manifest.status != RunStatus.ARCHIVED
+        ]
+        retained.sort(key=lambda item: item.manifest.created_at)
+        while len(retained) >= self.retained_run_limit:
+            oldest = retained.pop(0)
+            task = self._run_tasks.get(oldest.run_id)
+            if task and not task.done():
+                break
+            await self.archive_run(oldest.run_id)

@@ -54,7 +54,7 @@ class SkillsReader:
         names: list[str] = []
         for tools in self._parsed_categories.values():
             names.extend(tools)
-        return names
+        return names or self.registry.get_names()
 
     def get_tools_by_category(self, category: str) -> list[dict[str, Any]]:
         """Get full OpenAI schemas for tools in a given category."""
@@ -89,7 +89,9 @@ class SkillsReader:
             try:
                 names = json.loads(match.group())
                 if isinstance(names, list):
-                    return self.registry.get_openai_schemas(names)
+                    known = [str(name) for name in names if self.registry.get(str(name))]
+                    if known:
+                        return self.registry.get_openai_schemas(known)
             except Exception:
                 pass
 

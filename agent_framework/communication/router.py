@@ -19,10 +19,17 @@ class AgentRole(str, Enum):
 class AgentNode:
     """Represents an agent in the hierarchy tree."""
 
-    def __init__(self, agent_id: str, role: AgentRole, parent_id: str | None = None):
+    def __init__(
+        self,
+        agent_id: str,
+        role: AgentRole,
+        parent_id: str | None = None,
+        run_id: str = "",
+    ):
         self.agent_id = agent_id
         self.role = role
         self.parent_id = parent_id
+        self.run_id = run_id
         self.children_ids: list[str] = []
 
 
@@ -43,8 +50,14 @@ class Router:
         self._nodes: dict[str, AgentNode] = {}
         self._channels: dict[str, Channel] = {}
 
-    def register(self, agent_id: str, role: AgentRole, parent_id: str | None = None) -> Channel:
-        node = AgentNode(agent_id, role, parent_id)
+    def register(
+        self,
+        agent_id: str,
+        role: AgentRole,
+        parent_id: str | None = None,
+        run_id: str = "",
+    ) -> Channel:
+        node = AgentNode(agent_id, role, parent_id, run_id)
         self._nodes[agent_id] = node
         if parent_id and parent_id in self._nodes:
             self._nodes[parent_id].children_ids.append(agent_id)
@@ -61,6 +74,18 @@ class Router:
                 parent.children_ids.remove(agent_id)
         self._channels.pop(agent_id, None)
 
+    def unregister_subtree(self, agent_id: str, keep_root: bool = False) -> None:
+        """Remove an agent and all descendants from routing state."""
+        node = self._nodes.get(agent_id)
+        if not node:
+            return
+        for child_id in list(node.children_ids):
+            self.unregister_subtree(child_id)
+        if not keep_root:
+            self.unregister(agent_id)
+        else:
+            node.children_ids.clear()
+
     def get_channel(self, agent_id: str) -> Channel | None:
         return self._channels.get(agent_id)
 
@@ -68,6 +93,11 @@ class Router:
         sender = self._nodes.get(sender_id)
         receiver = self._nodes.get(receiver_id)
         if not sender or not receiver:
+            return False
+
+        # Retained agents from different runs must never become accidental peers.
+        if (sender.role != AgentRole.MASTER and receiver.role != AgentRole.MASTER
+                and sender.run_id != receiver.run_id):
             return False
 
         # Parent-child (either direction)
@@ -112,7 +142,8 @@ class Router:
         if node.role == AgentRole.HEAD:
             return [
                 aid for aid, n in self._nodes.items()
-                if n.role == AgentRole.HEAD and aid != agent_id
+                if (n.role == AgentRole.HEAD and aid != agent_id
+                    and n.run_id == node.run_id)
             ]
         elif node.role == AgentRole.NODE and node.parent_id:
             parent = self._nodes.get(node.parent_id)
@@ -128,8 +159,11 @@ class Router:
         node = self._nodes.get(agent_id)
         return node.parent_id if node else None
 
-    def get_all_heads(self) -> list[str]:
-        return [aid for aid, n in self._nodes.items() if n.role == AgentRole.HEAD]
+    def get_all_heads(self, run_id: str | None = None) -> list[str]:
+        return [
+            aid for aid, node in self._nodes.items()
+            if node.role == AgentRole.HEAD and (run_id is None or node.run_id == run_id)
+        ]
 
     def get_head_roster(self, exclude_id: str | None = None) -> list[dict[str, str]]:
         """Return a brief roster of all Head agents (id + role description placeholder)."""

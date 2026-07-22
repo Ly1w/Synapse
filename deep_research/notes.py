@@ -6,6 +6,7 @@ so they survive across agent turns within the same research session.
 
 import json
 import os
+import re
 from datetime import datetime
 from pathlib import Path
 from typing import Optional
@@ -13,6 +14,12 @@ from typing import Optional
 from .config import STORAGE_DIR
 
 _SESSION_ID: Optional[str] = None
+_SESSION_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]{0,127}$")
+
+
+def _validate_session_id(session_id: str) -> None:
+    if not _SESSION_PATTERN.fullmatch(session_id) or session_id in {".", ".."}:
+        raise ValueError("Invalid session id")
 
 
 def _session_dir() -> Path:
@@ -20,7 +27,11 @@ def _session_dir() -> Path:
     global _SESSION_ID
     if _SESSION_ID is None:
         _SESSION_ID = datetime.now().strftime("session_%Y%m%d_%H%M%S")
-    path = Path(STORAGE_DIR) / _SESSION_ID
+    _validate_session_id(_SESSION_ID)
+    root = Path(STORAGE_DIR).expanduser().resolve()
+    path = (root / _SESSION_ID).resolve()
+    if not path.is_relative_to(root):
+        raise ValueError("Session path escapes storage directory")
     path.mkdir(parents=True, exist_ok=True)
     return path
 
@@ -55,6 +66,7 @@ def set_session(session_id: str) -> str:
         Confirmation message with the session directory path.
     """
     global _SESSION_ID
+    _validate_session_id(session_id)
     _SESSION_ID = session_id
     path = _session_dir()
     return f"Session set to '{session_id}'. Storage: {path}"

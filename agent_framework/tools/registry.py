@@ -4,7 +4,7 @@ import json
 import logging
 from typing import Any, Callable, Awaitable
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, ConfigDict, Field
 
 logger = logging.getLogger(__name__)
 
@@ -18,8 +18,7 @@ class ToolDef(BaseModel):
     category: str = ""
     callable: Any = Field(default=None, exclude=True)
 
-    class Config:
-        arbitrary_types_allowed = True
+    model_config = ConfigDict(arbitrary_types_allowed=True)
 
     def to_openai_schema(self) -> dict[str, Any]:
         """Convert to OpenAI function-calling tool format."""
@@ -58,6 +57,8 @@ class ToolRegistry:
         category: str = "",
         callable_fn: Callable[..., Any] | None = None,
     ) -> ToolDef:
+        if name.startswith("framework_"):
+            raise ValueError("Tool names beginning with 'framework_' are reserved")
         tool = ToolDef(
             name=name,
             description=description,
@@ -81,7 +82,7 @@ class ToolRegistry:
             name=func["name"],
             description=func.get("description", ""),
             parameters=func.get("parameters"),
-            category=category,
+            category=category or str(schema.get("category") or func.get("category") or ""),
             callable_fn=callable_fn,
         )
 
@@ -103,6 +104,9 @@ class ToolRegistry:
 
     def get(self, name: str) -> ToolDef | None:
         return self._tools.get(name)
+
+    def unregister(self, name: str) -> None:
+        self._tools.pop(name, None)
 
     def get_names(self) -> list[str]:
         return list(self._tools.keys())

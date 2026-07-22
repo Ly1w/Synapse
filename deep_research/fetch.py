@@ -1,8 +1,11 @@
 """Webpage and academic paper content fetching tools."""
 
 import json
+import ipaddress
 import re
+import socket
 from typing import Optional
+from urllib.parse import urljoin, urlparse
 
 import httpx
 from bs4 import BeautifulSoup
@@ -19,9 +22,28 @@ _HEADERS = {
 }
 
 
+def _validate_public_http_url(url: str) -> str | None:
+    """Reject non-HTTP and private-network targets before each request/redirect."""
+    parsed = urlparse(url)
+    if parsed.scheme not in {"http", "https"} or not parsed.hostname:
+        return "Only absolute http(s) URLs are allowed"
+    if parsed.username or parsed.password:
+        return "Credentials in URLs are not allowed"
+    try:
+        addresses = {
+            item[4][0].split("%", 1)[0]
+            for item in socket.getaddrinfo(parsed.hostname, parsed.port or 0)
+        }
+    except socket.gaierror as exc:
+        return f"Unable to resolve host: {exc}"
+    if not addresses or any(not ipaddress.ip_address(value).is_global for value in addresses):
+        return "Private, local, or non-global network targets are not allowed"
+    return None
+
+
 def _extract_text(html: str) -> str:
     """Extract clean readable text from HTML, stripping boilerplate."""
-    soup = BeautifulSoup(html, "lxml")
+    soup = BeautifulSoup(html, "html.parser")
 
     # Remove non-content tags
     for tag in soup(["script", "style", "nav", "footer", "header", "aside", "form"]):
@@ -56,9 +78,24 @@ def fetch_webpage(url: str, max_chars: int = _MAX_WEBPAGE_CHARS) -> str:
           - content: extracted text (truncated to max_chars)
           - truncated: whether content was cut off
     """
+    max_chars = max(500, min(int(max_chars), _MAX_WEBPAGE_CHARS))
+    requested_url = url
     try:
-        resp = httpx.get(url, headers=_HEADERS, follow_redirects=True, timeout=20)
-        resp.raise_for_status()
+        for _ in range(5):
+            validation_error = _validate_public_http_url(url)
+            if validation_error:
+                return json.dumps({"error": validation_error, "url": url})
+            resp = httpx.get(url, headers=_HEADERS, follow_redirects=False, timeout=20)
+            if resp.is_redirect:
+                location = resp.headers.get("location")
+                if not location:
+                    return json.dumps({"error": "Redirect missing location", "url": url})
+                url = urljoin(url, location)
+                continue
+            resp.raise_for_status()
+            break
+        else:
+            return json.dumps({"error": "Too many redirects", "url": requested_url})
     except httpx.HTTPError as e:
         return json.dumps({"error": str(e), "url": url})
 
@@ -68,7 +105,7 @@ def fetch_webpage(url: str, max_chars: int = _MAX_WEBPAGE_CHARS) -> str:
             {"error": f"Non-HTML content type: {content_type}", "url": url}
         )
 
-    soup = BeautifulSoup(resp.text, "lxml")
+    soup = BeautifulSoup(resp.text, "html.parser")
     title_tag = soup.find("title")
     title = title_tag.get_text(strip=True) if title_tag else ""
 

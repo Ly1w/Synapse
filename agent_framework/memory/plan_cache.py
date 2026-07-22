@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+import asyncio
 import time
 from pathlib import Path
 from typing import Any
@@ -97,23 +98,31 @@ class PlanCache:
         self.cache_dir = Path(cache_dir or DEFAULT_CACHE_DIR)
         self.cache_file = self.cache_dir / "cache.json"
         self._entries: dict[str, PlanCacheEntry] = {}
+        self._lock = asyncio.Lock()
 
     async def initialize(self) -> None:
         self.cache_dir.mkdir(parents=True, exist_ok=True)
         if self.cache_file.exists():
-            async with aiofiles.open(self.cache_file, "r") as f:
-                data = json.loads(await f.read())
-            self._entries = {
-                k: PlanCacheEntry.from_dict(v) for k, v in data.items()
-            }
-            logger.info("Loaded %d plan cache entries", len(self._entries))
+            try:
+                async with aiofiles.open(self.cache_file, "r") as f:
+                    data = json.loads(await f.read())
+                self._entries = {
+                    k: PlanCacheEntry.from_dict(v) for k, v in data.items()
+                }
+                logger.info("Loaded %d plan cache entries", len(self._entries))
+            except (OSError, json.JSONDecodeError, TypeError, ValueError):
+                logger.exception("Ignoring unreadable plan cache: %s", self.cache_file)
+                self._entries = {}
 
     async def _save(self) -> None:
-        async with aiofiles.open(self.cache_file, "w") as f:
-            await f.write(json.dumps(
-                {k: v.to_dict() for k, v in self._entries.items()},
-                indent=2,
-            ))
+        async with self._lock:
+            temp_file = self.cache_file.with_suffix(".json.tmp")
+            async with aiofiles.open(temp_file, "w") as f:
+                await f.write(json.dumps(
+                    {k: v.to_dict() for k, v in self._entries.items()},
+                    indent=2,
+                ))
+            os.replace(temp_file, self.cache_file)
 
     async def extract_keyword(self, task: str) -> str:
         """Extract a high-level intent keyword from a task query."""

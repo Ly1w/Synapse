@@ -124,8 +124,13 @@ class ContextManager:
         if len(self._messages) <= self.keep_recent:
             return
 
-        older = self._messages[:-self.keep_recent]
-        recent = self._messages[-self.keep_recent:]
+        cut = len(self._messages) - self.keep_recent
+        # Never split an assistant tool-call message from its tool results.  Invalid
+        # call/result adjacency would make the next model request fail.
+        while cut > 0 and self._messages[cut].get("role") == "tool":
+            cut -= 1
+        older = self._messages[:cut]
+        recent = self._messages[cut:]
 
         summary_parts: list[str] = []
         if self._compaction_summary:
@@ -150,6 +155,23 @@ class ContextManager:
     def clear_messages(self) -> None:
         self._messages.clear()
         self._compaction_summary = ""
+
+    def export_state(self) -> dict[str, Any]:
+        """Return a JSON-serializable snapshot suitable for retained runs."""
+        return {
+            "system_prompt": self._system_prompt,
+            "pinned": list(self._pinned),
+            "messages": list(self._messages),
+            "compaction_summary": self._compaction_summary,
+            "max_tokens": self.max_tokens,
+        }
+
+    def restore_state(self, state: dict[str, Any]) -> None:
+        """Restore a prior snapshot without replaying compaction side effects."""
+        self._system_prompt = str(state.get("system_prompt", self._system_prompt))
+        self._pinned = list(state.get("pinned", []))
+        self._messages = list(state.get("messages", []))
+        self._compaction_summary = str(state.get("compaction_summary", ""))
 
     @property
     def message_count(self) -> int:

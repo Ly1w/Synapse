@@ -1,0 +1,240 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <meta name="theme-color" content="#111318" />
+    <title>Synapse Control Room</title>
+    <link rel="stylesheet" href="/static/styles.css" />
+  </head>
+  <body>
+    <div class="noise" aria-hidden="true"></div>
+    <header class="topbar">
+      <a class="brand" href="/" aria-label="Synapse home">
+        <svg class="brand-mark" viewBox="0 0 44 44" aria-hidden="true">
+          <path d="M9 12.5 22 5l13 7.5v15L22 35 9 27.5z" />
+          <circle cx="22" cy="13" r="3" />
+          <circle cx="15" cy="25" r="3" />
+          <circle cx="29" cy="25" r="3" />
+          <path d="m20.3 15.5-3.6 6.3m7-6.3 3.6 6.3M18 25h8" />
+        </svg>
+        <span>
+          <strong>SYNAPSE</strong>
+          <small>CONTROL ROOM</small>
+        </span>
+      </a>
+      <div class="topbar-meta">
+        <div class="connection" id="connectionBadge">
+          <span class="pulse-dot"></span>
+          <span id="connectionLabel">Connecting</span>
+        </div>
+        <div class="model-chip search-chip" id="searchChip">SEARCH —</div>
+        <div class="model-chip" id="modelChip">MODEL —</div>
+        <button class="icon-button mobile-runs-button" id="mobileRunsButton" aria-label="Show runs">
+          <span></span><span></span><span></span>
+        </button>
+      </div>
+    </header>
+
+    <div class="app-shell">
+      <aside class="runs-panel" id="runsPanel">
+        <section class="new-run-card">
+          <div class="section-kicker">NEW MISSION</div>
+          <h1>Give the hierarchy<br />a problem to own.</h1>
+          <form id="newRunForm">
+            <label class="sr-only" for="requestInput">New run request</label>
+            <textarea
+              id="requestInput"
+              rows="6"
+              maxlength="100000"
+              placeholder="Describe the outcome, constraints, and what success looks like…"
+              required
+            ></textarea>
+            <div class="composer-footer">
+              <span><kbd>⌘</kbd><kbd>↵</kbd> to launch</span>
+              <button class="primary-button" id="launchButton" type="submit">
+                <span>Launch run</span>
+                <svg viewBox="0 0 20 20" aria-hidden="true"><path d="m6 4 8 6-8 6V4Z" /></svg>
+              </button>
+            </div>
+          </form>
+        </section>
+
+        <div class="panel-heading">
+          <span>RUN HISTORY</span>
+          <span class="count-badge" id="runCount">0</span>
+        </div>
+        <nav class="run-list" id="runList" aria-label="Run history">
+          <div class="skeleton run-skeleton"></div>
+          <div class="skeleton run-skeleton short"></div>
+        </nav>
+        <div class="runs-footer">
+          <span>Retained locally</span>
+          <button class="text-button" id="refreshRunsButton">Refresh</button>
+        </div>
+      </aside>
+
+      <main class="workspace" id="workspace">
+        <section class="empty-state" id="emptyState">
+          <div class="empty-orbit" aria-hidden="true">
+            <span class="orbit orbit-one"></span>
+            <span class="orbit orbit-two"></span>
+            <span class="core-node"></span>
+            <span class="satellite satellite-a"></span>
+            <span class="satellite satellite-b"></span>
+            <span class="satellite satellite-c"></span>
+          </div>
+          <div class="section-kicker">NO RUN SELECTED</div>
+          <h2>Orchestrate without losing the thread.</h2>
+          <p>
+            Launch a mission to watch Master form contracts, Heads own sub-problems,
+            and bounded Nodes execute the details.
+          </p>
+          <div class="empty-principles">
+            <span>Interruptible</span><i></i><span>Inspectable</span><i></i><span>Retained</span>
+          </div>
+        </section>
+
+        <div class="run-view hidden" id="runView">
+          <section class="run-header">
+            <div>
+              <div class="run-eyebrow">
+                <span class="status-pill" id="runStatus">—</span>
+                <span id="runIdLabel">RUN —</span>
+                <span id="revisionLabel">REV 0</span>
+              </div>
+              <h2 id="runTitle">Run</h2>
+              <p id="runMeta">Waiting for state…</p>
+            </div>
+            <div class="run-actions">
+              <button class="secondary-button danger-hover" id="cancelButton">Cancel</button>
+              <button class="secondary-button" id="archiveButton">Archive</button>
+            </div>
+          </section>
+
+          <section class="mission-strip" id="requirementsStrip">
+            <div class="mission-index">01</div>
+            <div>
+              <span>ACTIVE REQUIREMENT</span>
+              <p id="activeRequirement">—</p>
+            </div>
+            <button class="text-button" id="showRequirementsButton">View all</button>
+          </section>
+
+          <section class="topology-section">
+            <div class="section-heading-row">
+              <div>
+                <div class="section-kicker">LIVE TOPOLOGY</div>
+                <h3>Ownership map</h3>
+              </div>
+              <div class="legend">
+                <span><i class="legend-dot running"></i>Active</span>
+                <span><i class="legend-dot complete"></i>Settled</span>
+                <span><i class="legend-dot attention"></i>Attention</span>
+              </div>
+            </div>
+            <div class="topology-canvas" id="topologyCanvas">
+              <div class="topology-placeholder">
+                <span class="mini-spinner"></span> Waiting for the task graph
+              </div>
+            </div>
+          </section>
+
+          <section class="checkpoint-section">
+            <div class="section-heading-row">
+              <div>
+                <div class="section-kicker">MASTER CHECKPOINT</div>
+                <h3>Current synthesis</h3>
+              </div>
+              <button class="copy-button" id="copyResponseButton" title="Copy checkpoint">
+                <svg viewBox="0 0 20 20" aria-hidden="true"><path d="M7 6V3h10v10h-3M3 7h10v10H3z" /></svg>
+                Copy
+              </button>
+            </div>
+            <div class="checkpoint-body" id="checkpointBody">
+              <div class="checkpoint-waiting">
+                <span class="typing-dots"><i></i><i></i><i></i></span>
+                Master has not committed a checkpoint yet.
+              </div>
+            </div>
+          </section>
+
+          <section class="steer-section" id="steerSection">
+            <div class="steer-label">
+              <span>STEER THIS RUN</span>
+              <small>Master will route the change without discarding valid work.</small>
+            </div>
+            <form id="steerForm" class="steer-form">
+              <label class="sr-only" for="steerInput">Additional requirement</label>
+              <textarea
+                id="steerInput"
+                rows="2"
+                maxlength="50000"
+                placeholder="Add a constraint, correct direction, or request another checkpoint…"
+                required
+              ></textarea>
+              <button class="steer-button" id="steerButton" type="submit" aria-label="Send update">
+                <svg viewBox="0 0 24 24" aria-hidden="true"><path d="m4 12 16-8-6 16-2.5-6.5L4 12Zm7.5 1.5L20 4" /></svg>
+              </button>
+            </form>
+          </section>
+        </div>
+      </main>
+
+      <aside class="activity-panel">
+        <div class="activity-header">
+          <div>
+            <div class="section-kicker">EVENT STREAM</div>
+            <h2>Activity</h2>
+          </div>
+          <div class="live-indicator"><i></i>LIVE</div>
+        </div>
+        <div class="activity-filters" id="activityFilters">
+          <button class="filter-chip active" data-filter="all">All</button>
+          <button class="filter-chip" data-filter="agent">Agents</button>
+          <button class="filter-chip" data-filter="tool">Tools</button>
+          <button class="filter-chip" data-filter="control">Control</button>
+        </div>
+        <div class="activity-list" id="activityList">
+          <div class="activity-empty">
+            <svg viewBox="0 0 48 48" aria-hidden="true"><path d="M8 24h8l4-10 7 22 5-12h8" /></svg>
+            <p>Events will appear here as agents think, act, and report.</p>
+          </div>
+        </div>
+      </aside>
+    </div>
+
+    <div class="drawer-backdrop hidden" id="drawerBackdrop"></div>
+    <aside class="agent-drawer" id="agentDrawer" aria-hidden="true">
+      <div class="drawer-header">
+        <div>
+          <div class="section-kicker" id="drawerKind">AGENT SNAPSHOT</div>
+          <h2 id="drawerTitle">Agent</h2>
+          <code id="drawerId">—</code>
+        </div>
+        <button class="icon-button drawer-close" id="drawerClose" aria-label="Close details">
+          <svg viewBox="0 0 20 20" aria-hidden="true"><path d="m4 4 12 12M16 4 4 16" /></svg>
+        </button>
+      </div>
+      <div class="drawer-content" id="drawerContent"></div>
+    </aside>
+
+    <div class="modal-backdrop hidden" id="requirementsModal">
+      <div class="modal" role="dialog" aria-modal="true" aria-labelledby="requirementsTitle">
+        <div class="modal-header">
+          <div>
+            <div class="section-kicker">REQUIREMENT HISTORY</div>
+            <h2 id="requirementsTitle">Run revisions</h2>
+          </div>
+          <button class="icon-button" id="requirementsClose" aria-label="Close">
+            <svg viewBox="0 0 20 20" aria-hidden="true"><path d="m4 4 12 12M16 4 4 16" /></svg>
+          </button>
+        </div>
+        <div class="requirements-list" id="requirementsList"></div>
+      </div>
+    </div>
+
+    <div class="toast-region" id="toastRegion" aria-live="polite"></div>
+    <script src="/static/app.js" defer></script>
+  </body>
+</html>

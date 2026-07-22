@@ -42,6 +42,13 @@ class AgentRegistry:
     def get_all_ids(self) -> list[str]:
         return list(self._agents.keys())
 
+    def clear_except(self, keep_ids: set[str] | None = None) -> None:
+        """Remove completed run-scoped agents while retaining long-lived agents."""
+        keep = keep_ids or set()
+        for agent_id in list(self._agents):
+            if agent_id not in keep:
+                self.unregister(agent_id)
+
     @property
     def count(self) -> int:
         return len(self._agents)

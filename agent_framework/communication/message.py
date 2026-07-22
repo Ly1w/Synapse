@@ -13,6 +13,11 @@ class MessageType(str, Enum):
     REPORT = "report"
     CLARIFICATION = "clarification"
     PEER_MSG = "peer_msg"
+    PEER_REQUEST = "peer_request"
+    PEER_RESPONSE = "peer_response"
+    DISCOVERY = "discovery"
+    GUIDANCE = "guidance"
+    CANCEL = "cancel"
     ESCALATION = "escalation"
     PROGRESS = "progress"
 
@@ -25,6 +30,9 @@ class Message(BaseModel):
     receiver_id: str
     msg_type: MessageType
     content: dict[str, Any] = Field(default_factory=dict)
+    task_id: str = ""
+    correlation_id: str = ""
+    reply_to: str = ""
     timestamp: float = Field(default_factory=time.time)
 
     def summary(self, max_len: int = 200) -> str:

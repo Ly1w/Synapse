@@ -12,7 +12,7 @@ Cursor MCP config (~/.cursor/mcp.json or .cursor/mcp.json):
       "mcpServers": {
         "deep-research": {
           "command": "python",
-          "args": ["/volume/pt-coder/users/ywli/agent_framework/mcp_server.py"]
+          "args": ["/absolute/path/to/Synapse/mcp_server.py"]
         }
       }
     }
@@ -46,16 +46,24 @@ mcp = FastMCP("deep-research")
 # ---------------------------------------------------------------------------
 
 @mcp.tool()
-def tool_search_web(query: str, max_results: int = 5) -> str:
-    """Search the web using Serper (Google Search API).
+def tool_search_web(
+    query: str,
+    max_results: int = 5,
+    allowed_domains: list[str] | None = None,
+    blocked_domains: list[str] | None = None,
+) -> str:
+    """Search the public web without a search API key.
 
-    Returns a JSON array of results, each with title, url, and snippet.
+    Returns normalized title, URL, and snippet results. The domain filters follow
+    the same contract as Claude Code's WebSearch tool.
 
     Args:
         query: Search query string.
-        max_results: Maximum number of results to return (default 5).
+        max_results: Maximum number of results to return (default 5, max 10).
+        allowed_domains: If set, only return these domains and their subdomains.
+        blocked_domains: Never return these domains or their subdomains.
     """
-    return search_web(query, max_results)
+    return search_web(query, max_results, allowed_domains, blocked_domains)
 
 
 @mcp.tool()
@@ -85,7 +93,7 @@ def tool_fetch_webpage(url: str, max_chars: int = 8000) -> str:
 
     Args:
         url: The URL to fetch.
-        max_chars: Maximum characters to return (default 8000).
+        max_chars: Maximum characters to return (default and hard limit 8000).
     """
     return fetch_webpage(url, max_chars)
 

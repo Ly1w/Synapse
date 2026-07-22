@@ -12,6 +12,14 @@ from .config import STORAGE_DIR
 _REPORTS_DIR = Path(STORAGE_DIR) / "reports"
 
 
+def _existing_report_path(report_path: str) -> Path | None:
+    root = _REPORTS_DIR.expanduser().resolve()
+    path = Path(report_path).expanduser().resolve()
+    if not path.is_relative_to(root) or not path.is_file():
+        return None
+    return path
+
+
 def _safe_filename(title: str) -> str:
     """Convert a title to a filesystem-safe filename."""
     safe = re.sub(r"[^\w\s\-]", "", title).strip()
@@ -83,9 +91,9 @@ def append_section(
     Returns:
         JSON string with updated file info.
     """
-    path = Path(report_path)
-    if not path.exists():
-        return json.dumps({"error": f"File not found: {report_path}"})
+    path = _existing_report_path(report_path)
+    if path is None:
+        return json.dumps({"error": "Report path is outside the managed reports directory or missing"})
 
     suffix = path.suffix.lower()
     if suffix == ".md":
@@ -120,9 +128,9 @@ def read_report(report_path: str) -> str:
     Returns:
         JSON string with the file content.
     """
-    path = Path(report_path)
-    if not path.exists():
-        return json.dumps({"error": f"File not found: {report_path}"})
+    path = _existing_report_path(report_path)
+    if path is None:
+        return json.dumps({"error": "Report path is outside the managed reports directory or missing"})
 
     with open(path, "r", encoding="utf-8") as f:
         content = f.read()

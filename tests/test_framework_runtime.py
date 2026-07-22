@@ -286,6 +286,29 @@ class ForcedHierarchyLLM(DeterministicLLM):
         return await super().chat_text(messages, **kwargs)
 
 
+class RefusesForcedHierarchyLLM(DeterministicLLM):
+    async def chat_text(self, messages, **kwargs):
+        prompt = str(messages[-1].get("content", ""))
+        if (
+            "routing work for a Master Agent" in prompt
+            or "Repair an invalid routing decision" in prompt
+        ):
+            self.chat_text_calls += 1
+            forced = (
+                "Delegation requirement: FORCED" in prompt
+                or "Repair an invalid routing decision" in prompt
+            )
+            return json.dumps({
+                "mode": "direct",
+                "reason": "deliberately ignores forced delegation",
+                "direct_response": "HELLO" if not forced else "",
+                "direct_instruction": "work directly",
+                "sub_tasks": [],
+                "overall_strategy": "invalid direct response",
+            })
+        return await super().chat_text(messages, **kwargs)
+
+
 class DirectRevisionLLM:
     def __init__(self):
         self.route_count = 0
@@ -598,6 +621,59 @@ def test_explicit_multi_agent_revision_creates_visible_live_topology(tmp_path: P
         ]
         events = await master.get_run_events(run_id)
         assert sum(item["type"] == "agent_registered" for item in events) == 3
+
+    asyncio.run(scenario())
+
+
+def test_explicit_multi_agent_uses_bounded_fallback_if_planner_refuses(tmp_path: Path):
+    async def scenario():
+        fake = RefusesForcedHierarchyLLM()
+        master = _make_master(tmp_path, fake)
+        run_id = await master.start_request("你好")
+        # This fake deliberately returns an invalid direct routing decision, so the
+        # initial AUTO request remains Master-only.
+        assert await master.wait_for_run(run_id) != ""
+
+        await master.steer(run_id, "调用多agent仔细审查模型结构和训练代码")
+        result = await asyncio.wait_for(master.wait_for_run(run_id), timeout=5)
+
+        assert result == "FINAL"
+        state = await master.get_run_state(run_id)
+        assert state["status"] == RunStatus.COMPLETED_RETAINED.value
+        assert len(state["topology"]["heads"]) == 2
+        roles = [head["role"] for head in state["topology"]["heads"]]
+        assert roles == ["primary_owner", "independent_verifier"]
+        assert all(len(head["nodes"]) == 1 for head in state["topology"]["heads"])
+        verifier = next(
+            head for head in master._run_heads[run_id].values()
+            if head.role == "independent_verifier"
+        )
+        assert "primary_owner" in verifier.contract.dependencies
+        assert verifier.contract.context["dependency_outcomes"]["primary_owner"]
+
+    asyncio.run(scenario())
+
+
+def test_failed_revision_preserves_checkpoint_and_exposes_error(tmp_path: Path):
+    async def scenario():
+        journal = RunJournal("original", str(tmp_path / "runs"), run_id="failed-run")
+        await journal.initialize()
+        await journal.commit_checkpoint("GOOD CHECKPOINT", reason="test")
+        await journal.add_requirement("revision")
+        await journal.set_status(RunStatus.RUNNING)
+        await journal.set_status(RunStatus.FAILED_RETAINED, error="revision failed")
+
+        state = await journal.read_state()
+        assert state["last_error"] == "revision failed"
+        assert state["final_response"] == "GOOD CHECKPOINT"
+        assert state["checkpoints"][0]["response"] == "GOOD CHECKPOINT"
+
+        # Simulate the pre-last_error manifest format and verify read-time migration.
+        journal.manifest.last_error = ""
+        journal.manifest.final_response = "legacy revision failure"
+        migrated = await journal.read_state()
+        assert migrated["last_error"] == "legacy revision failure"
+        assert migrated["final_response"] == "GOOD CHECKPOINT"
 
     asyncio.run(scenario())
 
@@ -1102,6 +1178,7 @@ def test_web_control_room_runs_against_the_real_runtime_api(tmp_path: Path):
             assert "checkpoint-message" in script_response.text
             assert "recoverMissingRun" in script_response.text
             assert "error.status = response.status" in script_response.text
+            assert "run-error-message" in script_response.text
             health = client.get("/api/health").json()
             assert health["search"] == {
                 "status": "ready", "tools": ["WebSearch", "WebFetch"]

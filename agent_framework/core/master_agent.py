@@ -626,7 +626,13 @@ class MasterAgent(BaseAgent):
             logger.exception("Run %s failed", run_id)
             result = f"Run failed, but its state was retained: {exc}"
             await self._retain_master_state(run_id, result)
-            await journal.set_status(RunStatus.FAILED_RETAINED, result)
+            await journal.set_status(RunStatus.FAILED_RETAINED, error=result)
+            await journal.record(
+                "run_failed",
+                source=self.id,
+                task_id=run_id,
+                payload={"error": result, "revision": journal.manifest.revision},
+            )
             return result
 
     async def _resume_run(self, run_id: str) -> str:
@@ -654,7 +660,13 @@ class MasterAgent(BaseAgent):
             logger.exception("Retained run %s failed to resume", run_id)
             result = f"Run revision failed, but prior state remains retained: {exc}"
             await self._retain_master_state(run_id, result)
-            await journal.set_status(RunStatus.FAILED_RETAINED, result)
+            await journal.set_status(RunStatus.FAILED_RETAINED, error=result)
+            await journal.record(
+                "run_failed",
+                source=self.id,
+                task_id=run_id,
+                payload={"error": result, "revision": journal.manifest.revision},
+            )
             return result
 
     async def _resume_after_prior(

@@ -175,10 +175,11 @@ class TaskDecomposer:
         )
         repaired = self._parse_plan(repaired_raw)
         if repaired.get("mode") != "hierarchical" or not repaired.get("sub_tasks"):
-            raise RuntimeError(
-                "The planner did not produce a valid hierarchy for the user's explicit "
-                "multi-agent request; refusing to silently execute it as Master-only."
+            logger.error(
+                "Planner ignored an explicit multi-agent request twice; using the "
+                "runtime's bounded primary-plus-verification hierarchy"
             )
+            return self._forced_hierarchy_fallback(request)
         return repaired
 
     @staticmethod
@@ -215,6 +216,60 @@ class TaskDecomposer:
             return []
         content = awareness() if callable(awareness) else awareness
         return [{"role": "system", "content": content}] if content else []
+
+    @staticmethod
+    def _forced_hierarchy_fallback(request: str) -> dict[str, Any]:
+        """Honor explicit delegation even when the routing model refuses its schema."""
+        return {
+            "mode": "hierarchical",
+            "reason": (
+                "The routing model twice failed to honor explicit delegation. The runtime "
+                "selected a bounded primary-owner plus independent-verifier topology rather "
+                "than silently downgrading to Master-only execution or failing the Run."
+            ),
+            "direct_response": "",
+            "direct_instruction": "",
+            "sub_tasks": [
+                {
+                    "role": "primary_owner",
+                    "description": request,
+                    "scope": (
+                        "Own the requested work end to end. Stay within the user's cumulative "
+                        "requirements and produce concrete evidence, not process narration."
+                    ),
+                    "expected_output": "A complete evidence-backed primary deliverable",
+                    "acceptance_criteria": [
+                        "Every cumulative user requirement is addressed",
+                        "Material claims or changes are supported by concrete evidence",
+                    ],
+                    "dependencies": [],
+                    "suggested_tool_categories": [],
+                },
+                {
+                    "role": "independent_verifier",
+                    "description": (
+                        "Independently verify the primary result against the user's cumulative "
+                        "requirements; identify concrete errors, omissions, or unsupported claims."
+                    ),
+                    "scope": (
+                        "Verification and correction only. Do not duplicate the primary owner's "
+                        "full execution unless evidence must be checked independently."
+                    ),
+                    "expected_output": "An evidence-backed verification with necessary corrections",
+                    "acceptance_criteria": [
+                        "Check the primary result against every user requirement",
+                        "Report specific corrections or explicitly justify that none are needed",
+                    ],
+                    "dependencies": ["primary_owner"],
+                    "suggested_tool_categories": [],
+                },
+            ],
+            "overall_strategy": (
+                "One accountable owner completes the work; a dependent verifier checks it "
+                "before Master integration."
+            ),
+            "routing_fallback": "forced_hierarchy_after_two_invalid_model_decisions",
+        }
 
     @staticmethod
     def _parse_plan(raw: str) -> dict[str, Any]:

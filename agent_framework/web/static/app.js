@@ -543,7 +543,8 @@ function renderCheckpoint(run) {
           created_at: run.completed_at || run.updated_at,
         }]
       : [];
-  if (!checkpoints.length) {
+  const failure = String(run.last_error || "").trim();
+  if (!checkpoints.length && !failure) {
     ui.checkpointBody.innerHTML = `
       <div class="checkpoint-waiting">
         <span class="typing-dots"><i></i><i></i><i></i></span>
@@ -551,7 +552,15 @@ function renderCheckpoint(run) {
       </div>`;
     return;
   }
-  ui.checkpointBody.innerHTML = checkpoints.map((checkpoint) => `
+  const failureMarkup = failure ? `
+    <article class="checkpoint-message run-error-message">
+      <div class="checkpoint-message-meta">
+        <span>RUN ERROR · REV ${escapeHtml(run.revision ?? 0)}</span>
+        <time>${escapeHtml(formatClock(run.updated_at))}</time>
+      </div>
+      <div class="checkpoint-message-text">${escapeHtml(failure)}</div>
+    </article>` : "";
+  ui.checkpointBody.innerHTML = failureMarkup + checkpoints.map((checkpoint) => `
     <article class="checkpoint-message">
       <div class="checkpoint-message-meta">
         <span>MASTER · REV ${escapeHtml(checkpoint.revision ?? 0)}</span>
@@ -742,6 +751,7 @@ function eventPresentation(event) {
     master_step_finished: ["Master step finished", payload.message || payload.step || "Step finished", "✓"],
     master_direct_response: ["Master answered directly", payload.message || "No delegation needed", "M"],
     run_checkpoint_committed: ["Checkpoint committed", "The final response is ready", "✓"],
+    run_failed: ["Run failed · state retained", payload.error || "Failure recorded", "!"],
     guidance_applied: ["Head applied guidance", payload.guidance || "Contract updated", "H"],
     control_action: [`Control · ${payload.name || "action"}`, JSON.stringify(payload.result || {}), "C"],
     discovery_triaged: ["Discovery triaged", payload.discovery?.description || "Scope observation handled", "D"],

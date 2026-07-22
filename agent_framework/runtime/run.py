@@ -58,6 +58,7 @@ class RunManifest(BaseModel):
     requirements: list[str] = Field(default_factory=list)
     agent_ids: list[str] = Field(default_factory=list)
     final_response: str = ""
+    last_error: str = ""
     checkpoints: list[RunCheckpoint] = Field(default_factory=list)
     created_at: float = Field(default_factory=time.time)
     updated_at: float = Field(default_factory=time.time)
@@ -138,11 +139,20 @@ class RunJournal:
         self.agents_dir.mkdir(parents=True, exist_ok=True)
         await self._save_manifest()
 
-    async def set_status(self, status: RunStatus, final_response: str = "") -> None:
+    async def set_status(
+        self,
+        status: RunStatus,
+        final_response: str = "",
+        error: str = "",
+    ) -> None:
         self.manifest.status = status
         self.manifest.updated_at = time.time()
         if final_response:
             self.manifest.final_response = final_response
+        if error:
+            self.manifest.last_error = error
+        elif status == RunStatus.RUNNING:
+            self.manifest.last_error = ""
         if status in {
             RunStatus.COMPLETED_RETAINED,
             RunStatus.FAILED_RETAINED,
@@ -164,6 +174,7 @@ class RunJournal:
         )
         self.manifest.checkpoints.append(checkpoint)
         self.manifest.final_response = response
+        self.manifest.last_error = ""
         self.manifest.status = RunStatus.COMPLETED_RETAINED
         self.manifest.updated_at = time.time()
         self.manifest.completed_at = time.time()
@@ -228,6 +239,16 @@ class RunJournal:
 
     async def read_state(self) -> dict[str, Any]:
         state = self.manifest.model_dump(mode="json")
+        if (
+            state["status"] == RunStatus.FAILED_RETAINED.value
+            and state["checkpoints"]
+            and not state["last_error"]
+            and state["final_response"] != state["checkpoints"][-1]["response"]
+        ):
+            # Upgrade manifests written before last_error existed. A failed revision
+            # used to overwrite final_response even though prior checkpoints survived.
+            state["last_error"] = state["final_response"]
+            state["final_response"] = state["checkpoints"][-1]["response"]
         if not state["checkpoints"] and state["final_response"]:
             # Old Run manifests only retained the latest response. Expose it as one
             # legacy checkpoint so upgraded UIs remain useful without rewriting data.

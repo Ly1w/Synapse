@@ -992,6 +992,15 @@ button.agent-card:hover {
   background: var(--panel-raised);
 }
 
+.checkpoint-message.run-error-message {
+  border-color: rgba(255, 112, 92, 0.48);
+  background: rgba(255, 112, 92, 0.07);
+}
+
+.checkpoint-message.run-error-message .checkpoint-message-meta {
+  color: #ff8c7a;
+}
+
 .checkpoint-message-meta {
   display: flex;
   justify-content: space-between;

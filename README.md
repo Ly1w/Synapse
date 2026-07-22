@@ -38,13 +38,18 @@ and acceptance criteria. Every exit path returns an `AgentOutcome` such as
   independent verification, or a task too large for one coherent execution path.
 - **Explicit delegation is binding**: when the user explicitly requests multiple
   agents for the current work, the planner must produce a valid hierarchy and may not
-  silently downgrade the request to Master-only execution.
+  silently downgrade the request to Master-only execution. If the routing model
+  ignores that requirement twice, the runtime uses a bounded primary-owner followed
+  by an independent-verifier topology instead of failing the Run.
 - **Interruptible runs**: add user requirements while work is active with
   `MasterAgent.steer()`.
 - **Retained agents**: a final response is a checkpoint, not destruction. Head and
   Node contexts remain available for a later revision.
 - **Checkpoint history**: every Master response is retained with its Run revision;
   later steering creates a new response entry rather than overwriting the prior one.
+- **Visible retained failures**: a failed revision records `last_error` separately,
+  keeps the last valid checkpoint intact, and exposes the exact failure in the control
+  room instead of showing only a generic retained status.
 - **Durable action history**: messages, tool actions, decisions, outcomes, and agent
   context snapshots are written under `~/.agent_framework/runs/<run_id>/` by default.
 - **Restart-safe inspection**: persisted Runs are rediscovered after server restart as

@@ -85,39 +85,6 @@ Return the same routing JSON schema with mode="hierarchical", an empty
 direct_response, and at least one fully specified sub_task.
 """
 
-ADAPTED_DECOMPOSITION_PROMPT = """\
-Adapt this plan template for the current task. Fill in specifics.
-
-Plan template:
-{template}
-
-User request: {request}
-
-Available tool categories:
-{tool_categories}
-
-Return a JSON object with the same structure as the template but with specifics filled in:
-{{
-    "mode": "direct|hierarchical",
-    "reason": "why this mode is appropriate",
-    "direct_response": "complete direct answer or empty",
-    "direct_instruction": "direct execution instruction or empty",
-    "sub_tasks": [
-        {{
-            "role": "short_role_name",
-            "description": "specific description",
-            "scope": "explicit boundary",
-            "expected_output": "what to produce",
-            "acceptance_criteria": ["completion condition"],
-            "dependencies": [],
-            "suggested_tool_categories": []
-        }}
-    ],
-    "overall_strategy": "approach description"
-}}
-"""
-
-
 class TaskDecomposer:
     """Route coherent work to Master or decompose work that benefits from Heads."""
 
@@ -135,6 +102,7 @@ class TaskDecomposer:
         tool_categories: list[str] | None = None,
         force_hierarchical: bool | None = None,
         runtime_awareness: str | Callable[[], str] | None = None,
+        retrieved_memory: str = "",
     ) -> dict[str, Any]:
         """Choose direct Master execution or a bounded Head task graph."""
         cats_str = ", ".join(tool_categories) if tool_categories else "not specified"
@@ -146,6 +114,7 @@ class TaskDecomposer:
         messages = [
             {"role": "system", "content": self.system_prompt},
             *self._runtime_messages(runtime_awareness),
+            *self._memory_messages(retrieved_memory),
             {"role": "user", "content": DECOMPOSITION_PROMPT.format(
                 request=request,
                 tool_categories=cats_str,
@@ -163,6 +132,7 @@ class TaskDecomposer:
         repair_messages = [
             {"role": "system", "content": self.system_prompt},
             *self._runtime_messages(runtime_awareness),
+            *self._memory_messages(retrieved_memory),
             {"role": "user", "content": FORCED_HIERARCHY_REPAIR_PROMPT.format(
                 request=request,
                 tool_categories=cats_str,
@@ -187,27 +157,6 @@ class TaskDecomposer:
         """Recognize an explicit runtime-control directive, not general topic mentions."""
         return bool(_EXPLICIT_HIERARCHY_DIRECTIVE.search(text.strip()))
 
-    async def decompose_from_template(
-        self,
-        request: str,
-        template: str,
-        tool_categories: list[str] | None = None,
-        runtime_awareness: str | Callable[[], str] | None = None,
-    ) -> dict[str, Any]:
-        """Adapt a cached plan template for a new request."""
-        cats_str = ", ".join(tool_categories) if tool_categories else "not specified"
-        messages = [
-            {"role": "system", "content": self.system_prompt},
-            *self._runtime_messages(runtime_awareness),
-            {"role": "user", "content": ADAPTED_DECOMPOSITION_PROMPT.format(
-                template=template,
-                request=request,
-                tool_categories=cats_str,
-            )},
-        ]
-        raw = await self.llm_client.chat_text(messages, temperature=0.2, max_tokens=1200)
-        return self._parse_plan(raw)
-
     @staticmethod
     def _runtime_messages(
         awareness: str | Callable[[], str] | None,
@@ -216,6 +165,10 @@ class TaskDecomposer:
             return []
         content = awareness() if callable(awareness) else awareness
         return [{"role": "system", "content": content}] if content else []
+
+    @staticmethod
+    def _memory_messages(memory: str) -> list[dict[str, str]]:
+        return [{"role": "system", "content": memory}] if memory else []
 
     @staticmethod
     def _forced_hierarchy_fallback(request: str) -> dict[str, Any]:

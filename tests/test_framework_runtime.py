@@ -17,6 +17,7 @@ from agent_framework.core.contracts import AgentBudget, OutcomeStatus, TaskContr
 from agent_framework.core.master_agent import MasterAgent
 from agent_framework.core.node_agent import NodeAgent
 from agent_framework.llm.config import LLMConfig
+from agent_framework.memory import LongTermMemory
 from agent_framework.planning.decomposer import TaskDecomposer
 from agent_framework.runtime.run import RunJournal, RunStatus
 from agent_framework.skills import SkillCatalog
@@ -48,8 +49,6 @@ class DeterministicLLM:
     async def chat_text(self, messages, **kwargs):
         self.chat_text_calls += 1
         prompt = str(messages[-1].get("content", ""))
-        if "Extract the core intent" in prompt:
-            return "runtime_test"
         if "routing work for a Master Agent" in prompt:
             self.route_messages = list(messages)
             if "User request: 你好" in prompt:
@@ -115,8 +114,6 @@ class DeterministicLLM:
             })
         if "Produce the final response addressed directly" in prompt:
             return "FINAL REVISED" if "master-only" in prompt else "FINAL"
-        if "Extract a reusable plan template" in prompt:
-            return "one accountable owner followed by validation"
         return json.dumps({"action": "defer", "reason": "No expansion needed"})
 
     async def chat_with_tools(self, messages, tools, **kwargs):
@@ -332,18 +329,41 @@ class DirectRevisionLLM:
         return _completion("unused")
 
 
-def _make_master(tmp_path: Path, fake: DeterministicLLM) -> MasterAgent:
+class DirectMemoryLLM:
+    def __init__(self):
+        self.route_messages: list[list[dict]] = []
+
+    async def chat_text(self, messages, **kwargs):
+        prompt = str(messages[-1].get("content", ""))
+        if "routing work for a Master Agent" in prompt:
+            self.route_messages.append(list(messages))
+            first = "Research StateELF architecture" in prompt
+            return json.dumps({
+                "mode": "direct",
+                "reason": "The Master can answer from available evidence",
+                "direct_response": (
+                    "StateELF uses token-causal attention and recurrent summaries."
+                    if first else "Prior StateELF work was recalled."
+                ),
+                "direct_instruction": "",
+                "sub_tasks": [],
+                "overall_strategy": "Direct answer",
+            })
+        return "unused"
+
+    async def chat_with_tools(self, messages, tools, **kwargs):
+        return _completion("unused")
+
+
+def _make_master(tmp_path: Path, fake) -> MasterAgent:
     master = MasterAgent(
         LLMConfig(api_key="test", model="fake"),
         memory_root=str(tmp_path / "memory"),
-        cache_dir=str(tmp_path / "cache"),
         run_root=str(tmp_path / "runs"),
         workspace_root=str(tmp_path),
     )
     master.llm_client = fake
     master.task_decomposer.llm_client = fake
-    master.plan_cache.llm_client = fake
-    master._lightweight_client = fake
     master._executor_client = fake
     return master
 
@@ -752,6 +772,106 @@ def test_persisted_runs_reload_as_inspectable_cold_snapshots(tmp_path: Path):
     asyncio.run(scenario())
 
 
+def test_long_term_memory_backfills_old_runs_and_recalls_direct_checkpoints(tmp_path: Path):
+    async def scenario():
+        run_root = tmp_path / "runs"
+        old = RunJournal(
+            "调用多agent调研 /workspace/StateELF",
+            str(run_root),
+            run_id="run_stateelf_old",
+        )
+        await old.initialize()
+        await old.commit_checkpoint(
+            "StateELF uses token-level causal queries while block_size controls summary writes.",
+            reason="historical_analysis",
+        )
+        failed_recall = RunJournal(
+            "Do you remember the StateELF work?",
+            str(run_root),
+            run_id="run_stateelf_failed_recall",
+        )
+        await failed_recall.initialize()
+        await failed_recall.commit_checkpoint(
+            "I cannot find any prior record; please provide more context.",
+            reason="bad_recall",
+        )
+
+        fake = DirectMemoryLLM()
+        master = _make_master(tmp_path, fake)
+        await master._ensure_memory_index()
+        matches = await master.long_term_memory.search("还记得 StateELF 的设计吗")
+
+        assert matches[0]["run_id"] == "run_stateelf_old"
+        assert matches[0]["source_path"].endswith("run_stateelf_old")
+        assert "token-level causal queries" in matches[0]["response_excerpt"]
+        assert {"Recall", "ReadRun"}.issubset(master.get_tool_info()["builtin"])
+
+        run_id = await master.start_request("Research StateELF architecture")
+        assert "token-causal attention" in await master.wait_for_run(run_id)
+        recalled = await master.tool_executor.execute(
+            "Recall",
+            {"query": "StateELF", "limit": 5, "max_chars": 8_000},
+        )
+        assert recalled["match_count"] >= 2
+        expanded = await master.tool_executor.execute(
+            "ReadRun",
+            {"run_id": run_id, "max_chars": 10_000},
+        )
+        assert expanded["run_id"] == run_id
+        assert "token-causal attention" in expanded["response_excerpt"]
+
+        second_id = await master.start_request("Do you remember the StateELF work?")
+        assert await master.wait_for_run(second_id) == "Prior StateELF work was recalled."
+        routed_context = fake.route_messages[-1]
+        memory_message = next(
+            message["content"] for message in routed_context
+            if str(message.get("content", "")).startswith("<retrieved_long_term_memory>")
+        )
+        assert run_id in memory_message
+        assert "StateELF uses token-causal attention" in memory_message
+        events = await master.get_run_events(second_id)
+        assert any(item["type"] == "memory_retrieved" for item in events)
+
+    asyncio.run(scenario())
+
+
+def test_long_term_memory_keeps_failed_partial_evidence_and_redacts_secrets(tmp_path: Path):
+    async def scenario():
+        journal = RunJournal(
+            "Investigate failure-topic with ghp_abcdefghijklmnopqrstuvwxyz123456",
+            str(tmp_path / "runs"),
+            run_id="run_partial_memory",
+        )
+        await journal.initialize()
+        await journal.set_status(RunStatus.FAILED_RETAINED, error="Training diverged at step 42")
+        memory = LongTermMemory(str(tmp_path / "memory"))
+        await memory.remember_run(
+            journal,
+            workspace_root=tmp_path,
+            outcomes=[{
+                "agent_id": "head_partial",
+                "task_id": "task_partial",
+                "status": "partial",
+                "summary": "Useful gradients were inspected.",
+                "evidence": ["loss became non-finite"],
+                "unresolved": ["root cause remains unknown"],
+            }],
+        )
+        # Startup backfill contains no derived Head outcomes. It must refresh the
+        # journal fields without erasing richer evidence written at Run completion.
+        await memory.backfill_runs([journal], tmp_path)
+
+        matches = await memory.search("failure-topic")
+        assert matches[0]["status"] == RunStatus.FAILED_RETAINED.value
+        assert "Training diverged at step 42" in matches[0]["unresolved"]
+        assert "root cause remains unknown" in matches[0]["unresolved"]
+        assert matches[0]["agent_outcomes"][0]["agent_id"] == "head_partial"
+        assert "[REDACTED]" in matches[0]["request"]
+        assert "ghp_" not in matches[0]["request"]
+
+    asyncio.run(scenario())
+
+
 def test_cancel_retains_partial_agent_state_and_stops_children(tmp_path: Path):
     async def scenario():
         fake = DeterministicLLM(gate_node=True)
@@ -863,6 +983,12 @@ def test_context_compaction_keeps_tool_call_with_results():
 
 def test_ptc_module_was_removed():
     assert not (Path(__file__).parents[1] / "agent_framework" / "tools" / "ptc.py").exists()
+
+
+def test_plan_cache_module_was_removed():
+    memory_dir = Path(__file__).parents[1] / "agent_framework" / "memory"
+    assert not (memory_dir / "plan_cache.py").exists()
+    assert not (memory_dir / "memory_store.py").exists()
 
 
 def test_business_tools_cannot_override_control_protocol():
@@ -1194,7 +1320,10 @@ def test_web_control_room_runs_against_the_real_runtime_api(tmp_path: Path):
                 "status": "ready", "tools": ["WebSearch", "WebFetch"]
             }
             assert health["mcp"]["servers"] == []
-            assert {"Bash", "Read", "Write", "Edit", "Glob", "Grep", "Skill"}.issubset(
+            assert {
+                "Bash", "Read", "Write", "Edit", "Glob", "Grep", "Skill",
+                "Recall", "ReadRun",
+            }.issubset(
                 set(health["tools"]["builtin"])
             )
             assert client.put("/api/permissions", json={"mode": "ask"}).json()["mode"] == "ask"

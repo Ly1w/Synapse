@@ -3,8 +3,8 @@
 Synapse is a Master-first agent runtime with an optional bounded
 **Master → Head → Node** hierarchy. The Master handles ordinary conversation,
 coherent tasks, and small tool workflows itself; it creates Heads and Nodes only when
-delegation has a concrete benefit. The hierarchy keeps peer coordination, persistent
-memory, tool retrieval, and reusable plans while making ownership and termination
+delegation has a concrete benefit. The hierarchy keeps peer coordination, durable
+Run memory, and tool retrieval while making ownership and termination
 explicit.
 
 ## Architecture
@@ -143,7 +143,7 @@ pip install -e '.[web]'
 export SYNAPSE_BASE_URL=http://localhost:8000/v1
 export SYNAPSE_API_KEY=your-api-key
 export SYNAPSE_PLANNER_MODEL=your-model
-# Optional: SYNAPSE_EXECUTOR_MODEL and SYNAPSE_LIGHTWEIGHT_MODEL
+# Optional: SYNAPSE_EXECUTOR_MODEL
 export SYNAPSE_WORKSPACE=/absolute/path/to/your/project
 export SYNAPSE_PERMISSION_MODE=auto  # ask | auto | full
 
@@ -169,6 +169,8 @@ These tools are registered directly by the framework. They do not require MCP:
 | `Edit` | Exact, uniqueness-checked string replacement | write |
 | `Bash` | Bounded `/bin/bash -lc` command execution | shell |
 | `Skill` | List or load installed `SKILL.md` workflows | read |
+| `Recall` | Search durable prior Run memory | safe |
+| `ReadRun` | Expand one recalled Run record | safe |
 | `WebSearch` | Keyless public web search with domain filters | network |
 | `WebFetch` | Readable public-page fetch with SSRF protection | network |
 
@@ -254,16 +256,23 @@ MCP process unless the user submits its configuration.
 - Master alone may change the Head topology, subject to the Run budget.
 - Cross-layer, cross-group, and cross-Run messages are rejected by the Router.
 
-## Tools, plans, and memory
+## Tools and long-term memory
 
 - Built-in and user tool schemas are registered in `ToolRegistry`; the generated
   skills index is a compact retrieval catalog rather than executable code.
 - User-requested stdio MCP servers can be attached through
   `MasterAgent.connect_mcp_server()`; allowlisted remote tools stay namespaced and the
   process remains alive for the runtime lifecycle.
-- Plan templates are cached only after fully successful Head outcomes.
-- Master and Head memory is persistent. Recent memory is injected so old append-only
-  files do not permanently hide new information.
+- Every checkpoint and terminal partial, failed, or cancelled Run is indexed in a
+  shared SQLite long-term-memory store. Records retain run id, status, cumulative
+  requirements, checkpoint text, bounded Head outcomes, workspace, timestamp, and
+  source path.
+- Before routing a new request, Master retrieves a bounded relevant set from prior
+  Runs. Existing journals are backfilled automatically, so historical Runs remain
+  recallable after an upgrade or restart.
+- `Recall` searches prior Runs by entity, path, topic, or description; `ReadRun`
+  expands one matched record. Historical memory is evidence with provenance, not a
+  substitute for checking mutable repository state.
 - Tool call/result pairs remain atomic during context compaction.
 
 ## Deep Research MCP server

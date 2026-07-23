@@ -114,21 +114,3 @@ class ProgressTracker:
             for st in task.sub_tasks:
                 lines.append(self._format_task(st, indent + 1))
         return "\n".join(lines)
-
-    def to_execution_log(self) -> str:
-        """Serialize the full progress tree for plan cache extraction."""
-        if not self.root:
-            return ""
-        return self._log_task(self.root)
-
-    def _log_task(self, task: TaskProgress) -> str:
-        parts = [
-            f"Task: {task.description}",
-            f"  Role: {task.assigned_to}",
-            f"  Status: {task.status.value}",
-        ]
-        if task.result_summary:
-            parts.append(f"  Result: {task.result_summary[:500]}")
-        for st in task.sub_tasks:
-            parts.append(self._log_task(st))
-        return "\n".join(parts)

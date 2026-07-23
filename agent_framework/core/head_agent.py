@@ -10,7 +10,6 @@ from ..communication.message import Message, MessageType
 from ..communication.router import AgentRole, Router
 from ..context.manager import ContextManager
 from ..llm.client import LLMClient
-from ..memory.memory_store import MemoryStore
 from ..skills import SkillCatalog
 from ..system_prompts import build_head_system_prompt
 from ..tools.registry import ToolRegistry
@@ -90,7 +89,6 @@ class HeadAgent(BaseAgent):
         agent_registry: AgentRegistry,
         skill_catalog: SkillCatalog | None = None,
         peer_roster: str = "",
-        memory_store: MemoryStore | None = None,
         context_manager: ContextManager | None = None,
         max_turns: int = 20,
         contract: TaskContract | None = None,
@@ -110,7 +108,6 @@ class HeadAgent(BaseAgent):
         self.node_llm_client = node_llm_client or llm_client
         self.permission_manager = permission_manager
         self.peer_roster_text = peer_roster or "No peers yet."
-        self.memory_store = memory_store
         self.child_budget = child_budget or AgentBudget(
             max_turns=10,
             max_peer_messages=2,
@@ -129,7 +126,6 @@ class HeadAgent(BaseAgent):
         self._discoveries_handled = 0
         self._revision_rounds = 0
         self._cancel_requested = False
-        self._memory_loaded = False
         self._applied_revisions: set[int] = set()
 
         actual_budget = budget or AgentBudget(
@@ -253,7 +249,6 @@ class HeadAgent(BaseAgent):
         logger.info("HeadAgent %s starting: %s", self.id, self.task[:100])
 
         try:
-            await self._load_memory_once()
             preparation = await self._prepare_work()
             self._head_analysis = str(preparation.get("head_analysis", ""))
             await self._launch_assignments(preparation.get("node_assignments", []))
@@ -318,15 +313,6 @@ class HeadAgent(BaseAgent):
 
         await self._finish_phase(outcome)
         return outcome
-
-    async def _load_memory_once(self) -> None:
-        if self._memory_loaded or not self.memory_store:
-            return
-        await self.memory_store.initialize()
-        memory = await self.memory_store.read()
-        if memory:
-            self.context.add_pinned(self.memory_store.get_injection_prompt(memory))
-        self._memory_loaded = True
 
     async def _prepare_work(self) -> dict[str, Any]:
         await self.record_event("agent_step_started", {
@@ -734,10 +720,6 @@ class HeadAgent(BaseAgent):
             MessageType.REPORT,
             outcome.to_message_content(),
         )
-        if self.memory_store and outcome.successful:
-            await self.memory_store.append(
-                f"## Task: {self.task[:100]}\nResult: {outcome.summary[:500]}\n"
-            )
         await self.record_event("agent_phase_finished", outcome.to_message_content())
         if self.journal:
             await self.journal.snapshot_agent(

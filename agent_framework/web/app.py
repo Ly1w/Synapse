@@ -54,7 +54,6 @@ def create_master_from_env() -> MasterAgent:
     api_key = os.environ.get("SYNAPSE_API_KEY") or os.environ.get("OPENAI_API_KEY") or "local"
     planner_model = os.environ.get("SYNAPSE_PLANNER_MODEL", "gpt-4o")
     executor_model = os.environ.get("SYNAPSE_EXECUTOR_MODEL", planner_model)
-    lightweight_model = os.environ.get("SYNAPSE_LIGHTWEIGHT_MODEL", planner_model)
     timeout = float(os.environ.get("SYNAPSE_LLM_TIMEOUT", "120"))
     config = FrameworkLLMConfig(
         planner=LLMConfig(
@@ -69,17 +68,10 @@ def create_master_from_env() -> MasterAgent:
             model=executor_model,
             timeout=timeout,
         ),
-        lightweight=LLMConfig(
-            base_url=base_url,
-            api_key=api_key,
-            model=lightweight_model,
-            timeout=timeout,
-        ),
     )
     return MasterAgent(
         llm_config=config,
         memory_root=os.environ.get("SYNAPSE_MEMORY_ROOT"),
-        cache_dir=os.environ.get("SYNAPSE_CACHE_DIR"),
         run_root=os.environ.get("SYNAPSE_RUN_ROOT"),
         workspace_root=os.environ.get("SYNAPSE_WORKSPACE", str(REPOSITORY_ROOT)),
         permission_mode=os.environ.get("SYNAPSE_PERMISSION_MODE", "auto"),

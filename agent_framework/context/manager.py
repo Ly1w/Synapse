@@ -60,6 +60,13 @@ class ContextManager:
     def clear_pinned(self) -> None:
         self._pinned.clear()
 
+    def remove_pinned(self, content_prefix: str) -> None:
+        """Remove pinned context owned by one identifiable runtime feature."""
+        self._pinned = [
+            item for item in self._pinned
+            if not str(item.get("content", "")).startswith(content_prefix)
+        ]
+
     def add_message(self, message: dict[str, Any]) -> None:
         self._messages.append(message)
         if self.estimate_tokens() > self.max_tokens * self.compaction_threshold:

@@ -14,8 +14,7 @@ from ..communication.router import AgentRole, Router
 from ..context.manager import ContextManager
 from ..llm.client import LLMClient
 from ..llm.config import FrameworkLLMConfig, LLMConfig
-from ..memory.memory_store import MemoryStore
-from ..memory.plan_cache import PlanCache
+from ..memory import LongTermMemory
 from ..planning.decomposer import TaskDecomposer
 from ..planning.progress import ProgressTracker, TaskProgress, TaskStatus
 from ..runtime.run import RunJournal, RunStatus, redact_state
@@ -66,7 +65,6 @@ class MasterAgent(BaseAgent):
         llm_config: LLMConfig | FrameworkLLMConfig | None = None,
         tool_registry: ToolRegistry | None = None,
         memory_root: str | None = None,
-        cache_dir: str | None = None,
         run_root: str | None = None,
         max_context_tokens: int = 128000,
         budget: AgentBudget | None = None,
@@ -83,7 +81,6 @@ class MasterAgent(BaseAgent):
             self._framework_config = FrameworkLLMConfig(planner=config)
 
         planner_client = LLMClient(self._framework_config.planner)
-        self._lightweight_client = LLMClient(self._framework_config.get_lightweight())
         self._executor_client = LLMClient(self._framework_config.get_executor())
         self.tool_registry = tool_registry or ToolRegistry()
         self.workspace_root = Path(workspace_root or Path.cwd()).expanduser().resolve()
@@ -92,17 +89,16 @@ class MasterAgent(BaseAgent):
             self.tool_registry,
             self.workspace_root,
         )
+        self.long_term_memory = LongTermMemory(memory_root)
+        self._register_memory_tools()
         self.tool_executor = ToolExecutor(self.tool_registry, self.permission_manager)
         self.agent_registry = AgentRegistry()
         self.router = Router()
 
         master_id = AgentRegistry.generate_id("master")
         channel = self.router.register(master_id, AgentRole.MASTER)
-        self._memory_root = memory_root
         self._run_root = run_root
         self.retained_run_limit = retained_run_limit
-        self.memory_store = MemoryStore("master", memory_root)
-        self.plan_cache = PlanCache(self._lightweight_client, cache_dir)
         self.head_budget = head_budget or AgentBudget(
             max_turns=20,
             max_peer_messages=4,
@@ -175,8 +171,10 @@ class MasterAgent(BaseAgent):
         self._master_context_states: dict[str, dict[str, Any]] = {}
         self._run_deferred_contracts: dict[str, list[TaskContract]] = defaultdict(list)
         self._run_master_tool_call_counts: dict[str, int] = defaultdict(int)
+        self._run_memory_matches: dict[str, list[str]] = defaultdict(list)
         self._mcp_providers: list[MCPToolProvider] = []
         self._cold_run_ids: set[str] = set()
+        self._memory_backfill_complete = False
         self._load_persisted_runs()
 
     async def handle_user_request(
@@ -198,6 +196,7 @@ class MasterAgent(BaseAgent):
         """Start work in the background and return a run id that can be steered."""
         if any(not task.done() for task in self._run_tasks.values()):
             raise RuntimeError("This Master already has an active run; steer or await it first.")
+        await self._ensure_memory_index()
         # Skill metadata is cheap to rediscover and may have changed since the last Run.
         self._refresh_master_system_prompt()
         await self._enforce_retention_limit()
@@ -276,6 +275,7 @@ class MasterAgent(BaseAgent):
         active.clear()
         await self._retain_master_state(run_id, "Run cancelled by user.")
         await journal.set_status(RunStatus.CANCELLED_RETAINED)
+        await self._remember_run(run_id)
 
     async def archive_run(self, run_id: str) -> None:
         """Explicitly release live agents after their snapshots are safely on disk."""
@@ -322,14 +322,14 @@ class MasterAgent(BaseAgent):
         states.sort(key=lambda item: float(item.get("created_at", 0)), reverse=True)
         return states
 
-    def get_runtime_info(self) -> dict[str, str]:
+    def get_runtime_info(self) -> dict[str, Any]:
         """Return non-secret model routing metadata for control-plane clients."""
         return {
             "planner_model": self._framework_config.planner.model,
             "executor_model": self._framework_config.get_executor().model,
-            "lightweight_model": self._framework_config.get_lightweight().model,
             "base_url": self._framework_config.planner.base_url,
             "workspace_root": str(self.workspace_root),
+            "long_term_memory": self.long_term_memory.state(),
         }
 
     def get_tool_info(self) -> dict[str, Any]:
@@ -418,6 +418,12 @@ class MasterAgent(BaseAgent):
             "environment": {
                 "workspace_root": str(self.workspace_root),
                 "permission": self.permission_manager.get_state(),
+                "long_term_memory": {
+                    **self.long_term_memory.state(),
+                    "retrieved_run_ids": list(
+                        self._run_memory_matches.get(run_id, [])
+                    ) if run_id else [],
+                },
                 "builtin_tool_count": sum(
                     1 for item in tool_items if item.source == "builtin"
                 ),
@@ -427,6 +433,148 @@ class MasterAgent(BaseAgent):
             },
         })
         return state
+
+    def _register_memory_tools(self) -> None:
+        self.tool_registry.register(
+            "Recall",
+            (
+                "Search durable prior Run memory by project name, path, topic, or user "
+                "description. Returns bounded checkpoint excerpts with run_id, status, "
+                "timestamp, workspace, and source provenance."
+            ),
+            {
+                "type": "object",
+                "properties": {
+                    "query": {"type": "string"},
+                    "limit": {
+                        "type": "integer",
+                        "minimum": 1,
+                        "maximum": 20,
+                        "default": 5,
+                    },
+                    "max_chars": {
+                        "type": "integer",
+                        "minimum": 1000,
+                        "maximum": 40000,
+                        "default": 8000,
+                    },
+                },
+                "required": ["query"],
+            },
+            category="memory",
+            callable_fn=self._recall_memory_tool,
+            source="builtin",
+            permission_scope="safe",
+        )
+        self.tool_registry.register(
+            "ReadRun",
+            (
+                "Read a larger checkpoint excerpt and structured metadata for one run_id "
+                "returned by Recall or automatic long-term-memory retrieval."
+            ),
+            {
+                "type": "object",
+                "properties": {
+                    "run_id": {"type": "string"},
+                    "max_chars": {
+                        "type": "integer",
+                        "minimum": 1000,
+                        "maximum": 100000,
+                        "default": 20000,
+                    },
+                },
+                "required": ["run_id"],
+            },
+            category="memory",
+            callable_fn=self._read_run_memory_tool,
+            source="builtin",
+            permission_scope="safe",
+        )
+
+    async def _ensure_memory_index(self) -> None:
+        await self.long_term_memory.initialize()
+        if self._memory_backfill_complete:
+            return
+        await self.long_term_memory.backfill_runs(
+            self._run_journals.values(),
+            workspace_root=self.workspace_root,
+        )
+        self._memory_backfill_complete = True
+
+    async def _recall_memory_tool(
+        self,
+        query: str,
+        limit: int = 5,
+        max_chars: int = 8_000,
+    ) -> dict[str, Any]:
+        await self._ensure_memory_index()
+        return await self.long_term_memory.recall(query, limit, max_chars)
+
+    async def _read_run_memory_tool(
+        self,
+        run_id: str,
+        max_chars: int = 20_000,
+    ) -> dict[str, Any]:
+        await self._ensure_memory_index()
+        return await self.long_term_memory.read_run(run_id, max_chars)
+
+    async def _retrieve_memory_context(
+        self,
+        run_id: str,
+        request: str,
+        *,
+        exclude_run_id: str = "",
+    ) -> str:
+        await self._ensure_memory_index()
+        matches = await self.long_term_memory.search(
+            request,
+            limit=4,
+            exclude_run_id=exclude_run_id,
+            max_response_chars=2_500,
+        )
+        if matches:
+            relative_floor = float(matches[0]["relevance_score"]) * 0.35
+            matches = [
+                item for item in matches
+                if float(item["relevance_score"]) >= relative_floor
+            ]
+        self._run_memory_matches[run_id] = [
+            str(item["run_id"]) for item in matches
+        ]
+        if matches:
+            await self.record_event("memory_retrieved", {
+                "query": request[:500],
+                "matches": [
+                    {
+                        "run_id": item["run_id"],
+                        "status": item["status"],
+                        "relevance_score": item["relevance_score"],
+                        "source_path": item["source_path"],
+                    }
+                    for item in matches
+                ],
+            })
+        return self.long_term_memory.format_for_prompt(matches)
+
+    def _pin_memory_context(self, memory_context: str) -> None:
+        self.context.remove_pinned("<retrieved_long_term_memory>")
+        if memory_context:
+            self.context.add_pinned(memory_context)
+
+    async def _remember_run(self, run_id: str) -> None:
+        journal = self._run_journals.get(run_id)
+        if journal is None:
+            return
+        try:
+            await self.long_term_memory.remember_run(
+                journal,
+                workspace_root=self.workspace_root,
+                outcomes=self._latest_outcomes(run_id),
+            )
+        except Exception:
+            # Durable Run state remains authoritative even if the derived index is
+            # temporarily unavailable; the next process start will backfill it.
+            logger.exception("Failed to update long-term memory for Run %s", run_id)
 
     def set_permission_mode(self, mode: PermissionMode | str) -> dict[str, Any]:
         self.permission_manager.set_mode(mode)
@@ -541,10 +689,8 @@ class MasterAgent(BaseAgent):
                 "step": "planning",
                 "message": "Master is deciding whether this request needs delegation.",
             })
-            await self.memory_store.initialize()
-            memory = await self.memory_store.read()
-            if memory:
-                self.context.add_pinned(self.memory_store.get_injection_prompt(memory))
+            memory_context = await self._retrieve_memory_context(run_id, request)
+            self._pin_memory_context(memory_context)
 
             if tools:
                 self.tool_registry.register_batch(tools, tool_callables)
@@ -554,9 +700,10 @@ class MasterAgent(BaseAgent):
                 request,
                 tool_categories,
                 runtime_awareness=self.begin_llm_turn_awareness,
+                retrieved_memory=memory_context,
             )
 
-            pending = self._contracts_from_plan(plan, request)
+            pending = self._contracts_from_plan(plan, request, memory_context)
             await self.record_event("master_step_finished", {
                 "step": "planning",
                 "head_count": len(pending),
@@ -583,22 +730,6 @@ class MasterAgent(BaseAgent):
                     reason="master_direct_execution",
                 )
 
-            # Plan templates and tool retrieval are useful only after Master has
-            # actually chosen delegation. Simple direct work pays none of this cost.
-            await self.plan_cache.initialize()
-            keyword, cached_entry = await self.plan_cache.lookup(request)
-            if cached_entry:
-                adapted = await self.task_decomposer.decompose_from_template(
-                    request,
-                    cached_entry.template,
-                    tool_categories,
-                    runtime_awareness=self.begin_llm_turn_awareness,
-                )
-                adapted_pending = self._contracts_from_plan(adapted, request)
-                if adapted.get("mode") == "hierarchical" and adapted_pending:
-                    plan = adapted
-                    pending = adapted_pending
-
             tracker = ProgressTracker()
             root_progress = tracker.create_root(run_id, request)
             root_progress.mark_in_progress()
@@ -609,18 +740,10 @@ class MasterAgent(BaseAgent):
             final = await self._drive_and_commit(
                 run_id, request, pending, active, root_progress
             )
-            outcomes = self._latest_outcomes(run_id)
-            if outcomes and all(item.successful for item in outcomes):
-                await self._post_run_learning(
-                    keyword,
-                    tracker.to_execution_log(),
-                    request,
-                    str(plan.get("overall_strategy", "N/A")),
-                    final,
-                )
             return final
         except asyncio.CancelledError:
             await journal.set_status(RunStatus.CANCELLED_RETAINED)
+            await self._remember_run(run_id)
             raise
         except Exception as exc:
             logger.exception("Run %s failed", run_id)
@@ -633,6 +756,7 @@ class MasterAgent(BaseAgent):
                 task_id=run_id,
                 payload={"error": result, "revision": journal.manifest.revision},
             )
+            await self._remember_run(run_id)
             return result
 
     async def _resume_run(self, run_id: str) -> str:
@@ -655,6 +779,7 @@ class MasterAgent(BaseAgent):
             )
         except asyncio.CancelledError:
             await journal.set_status(RunStatus.CANCELLED_RETAINED)
+            await self._remember_run(run_id)
             raise
         except Exception as exc:
             logger.exception("Retained run %s failed to resume", run_id)
@@ -667,6 +792,7 @@ class MasterAgent(BaseAgent):
                 task_id=run_id,
                 payload={"error": result, "revision": journal.manifest.revision},
             )
+            await self._remember_run(run_id)
             return result
 
     async def _resume_after_prior(
@@ -712,6 +838,7 @@ class MasterAgent(BaseAgent):
                         "response_chars": len(candidate),
                     },
                 )
+                await self._remember_run(run_id)
                 return candidate
 
     async def _drive_scheduler(
@@ -1079,7 +1206,6 @@ class MasterAgent(BaseAgent):
             agent_registry=self.agent_registry,
             skill_catalog=self._builtin_toolset.skill_catalog,
             peer_roster=self._build_peer_roster(run_id, head_id),
-            memory_store=MemoryStore(f"head-{contract.role}", self._memory_root),
             contract=contract,
             budget=self.head_budget.model_copy(deep=True),
             child_budget=self.node_budget.model_copy(deep=True),
@@ -1155,12 +1281,15 @@ class MasterAgent(BaseAgent):
         self,
         plan: dict[str, Any],
         original_request: str,
+        memory_context: str = "",
     ) -> dict[str, TaskContract]:
         pending: dict[str, TaskContract] = {}
         for spec in plan.get("sub_tasks", [])[:4]:
             if not isinstance(spec, dict):
                 continue
             contract = self._contract_from_spec(spec, original_request)
+            if memory_context:
+                contract.context["retrieved_long_term_memory"] = memory_context
             contract.role = self._unique_role("", contract.role, pending)
             pending[contract.role] = contract
         return pending
@@ -1234,6 +1363,7 @@ class MasterAgent(BaseAgent):
                 "response_chars": len(response),
             },
         )
+        await self._remember_run(run_id)
         return response
 
     async def _resume_master_only_run(self, run_id: str) -> str:
@@ -1263,6 +1393,12 @@ class MasterAgent(BaseAgent):
             "revisions": [revision for revision, _ in applied_updates],
         })
         tool_categories = list(self.tool_registry.get_categories())
+        memory_context = await self._retrieve_memory_context(
+            run_id,
+            current_request,
+            exclude_run_id=run_id,
+        )
+        self._pin_memory_context(memory_context)
         force_hierarchical = any(
             self.task_decomposer.explicit_hierarchy_requested(update)
             for _, update in applied_updates
@@ -1272,8 +1408,9 @@ class MasterAgent(BaseAgent):
             tool_categories,
             force_hierarchical=force_hierarchical,
             runtime_awareness=self.begin_llm_turn_awareness,
+            retrieved_memory=memory_context,
         )
-        pending = self._contracts_from_plan(plan, current_request)
+        pending = self._contracts_from_plan(plan, current_request, memory_context)
         await self.record_event("master_step_finished", {
             "step": "rerouting",
             "head_count": len(pending),
@@ -1620,25 +1757,6 @@ class MasterAgent(BaseAgent):
                 "head_ids": list(self._run_heads[run_id]),
             },
         )
-
-    async def _post_run_learning(
-        self,
-        keyword: str | None,
-        execution_log: str,
-        request: str,
-        strategy: str,
-        final: str,
-    ) -> None:
-        try:
-            if keyword:
-                await self.plan_cache.store(keyword, execution_log)
-            await self.memory_store.append(
-                f"## Request: {request[:120]}\n"
-                f"Strategy: {strategy}\n"
-                f"Result: {final[:500]}\n"
-            )
-        except Exception:
-            logger.exception("Post-run learning failed")
 
     def _new_active_task_map(self, run_id: str) -> dict[str, asyncio.Task[AgentOutcome]]:
         active: dict[str, asyncio.Task[AgentOutcome]] = {}

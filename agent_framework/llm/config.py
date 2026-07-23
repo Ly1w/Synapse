@@ -18,16 +18,11 @@ class FrameworkLLMConfig(BaseModel):
     """
     Multi-model configuration for the framework.
 
-    Allows different models for planning (Master/Head), execution (Node),
-    and lightweight tasks (keyword extraction, plan adaptation).
+    Allows different models for planning (Master/Head) and execution (Node).
     """
 
     planner: LLMConfig = Field(default_factory=LLMConfig)
     executor: LLMConfig | None = None
-    lightweight: LLMConfig | None = None
 
     def get_executor(self) -> LLMConfig:
         return self.executor or self.planner
-
-    def get_lightweight(self) -> LLMConfig:
-        return self.lightweight or self.planner

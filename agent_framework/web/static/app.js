@@ -778,7 +778,7 @@ function classifyEvent(event) {
   if (
     type.includes("update") || type.includes("discovery") || type.includes("guidance")
     || type.includes("message") || type.includes("budget") || type.includes("control")
-    || type.includes("approval")
+    || type.includes("approval") || type.includes("memory")
   ) return "control";
   return "agent";
 }
@@ -817,6 +817,11 @@ function eventPresentation(event) {
     approval_resolved: [`Approval · ${payload.allowed ? "allowed" : "denied"}`, payload.tool_name || "Tool decision recorded", payload.allowed ? "✓" : "×"],
     approval_cancelled: ["Approval cancelled", payload.reason || "Owning phase ended", "×"],
     approval_expired: ["Approval expired", payload.reason || "No decision was received", "×"],
+    memory_retrieved: [
+      "Prior Runs recalled",
+      (payload.matches || []).map((item) => item.run_id).join(", ") || "No prior Run matched",
+      "R",
+    ],
   };
   return map[type] || [type.replaceAll("_", " "), summarizePayload(payload), "·"];
 }

@@ -862,12 +862,25 @@ def test_long_term_memory_keeps_failed_partial_evidence_and_redacts_secrets(tmp_
         await memory.backfill_runs([journal], tmp_path)
 
         matches = await memory.search("failure-topic")
+        assert memory.state()["backend"] == "markdown"
+        assert Path(memory.state()["memory_file"]).name == "MEMORY.md"
         assert matches[0]["status"] == RunStatus.FAILED_RETAINED.value
         assert "Training diverged at step 42" in matches[0]["unresolved"]
         assert "root cause remains unknown" in matches[0]["unresolved"]
         assert matches[0]["agent_outcomes"][0]["agent_id"] == "head_partial"
         assert "[REDACTED]" in matches[0]["request"]
         assert "ghp_" not in matches[0]["request"]
+
+        reloaded = LongTermMemory(str(tmp_path / "memory"))
+        persisted = await reloaded.read_run("run_partial_memory")
+        assert persisted["agent_outcomes"][0]["agent_id"] == "head_partial"
+        assert "root cause remains unknown" in persisted["memory_excerpt"]
+        assert "run_partial_memory" in await reloaded.read_index()
+
+        with open(reloaded.memory_file, "a", encoding="utf-8") as handle:
+            handle.write("\n## Curated by user\n\nKeep this note.\n")
+        await reloaded.backfill_runs([journal], tmp_path)
+        assert "Keep this note." in await reloaded.read_index()
 
     asyncio.run(scenario())
 

@@ -263,10 +263,12 @@ MCP process unless the user submits its configuration.
 - User-requested stdio MCP servers can be attached through
   `MasterAgent.connect_mcp_server()`; allowlisted remote tools stay namespaced and the
   process remains alive for the runtime lifecycle.
-- Every checkpoint and terminal partial, failed, or cancelled Run is indexed in a
-  shared SQLite long-term-memory store. Records retain run id, status, cumulative
-  requirements, checkpoint text, bounded Head outcomes, workspace, timestamp, and
-  source path.
+- Long-term memory is plain, project-scoped Markdown: a concise `MEMORY.md`
+  entrypoint plus detailed `runs/*.md` records. There is no hidden database. Run
+  journals, event logs, and agent snapshots remain the source of truth.
+- Every checkpoint and terminal partial, failed, or cancelled Run refreshes its
+  readable memory record. Records retain run id, status, cumulative requirements,
+  checkpoint text, bounded agent outcomes, workspace, timestamp, and source paths.
 - Before routing a new request, Master retrieves a bounded relevant set from prior
   Runs. Existing journals are backfilled automatically, so historical Runs remain
   recallable after an upgrade or restart.

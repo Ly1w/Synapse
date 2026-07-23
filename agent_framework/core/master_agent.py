@@ -89,7 +89,10 @@ class MasterAgent(BaseAgent):
             self.tool_registry,
             self.workspace_root,
         )
-        self.long_term_memory = LongTermMemory(memory_root)
+        self.long_term_memory = LongTermMemory(
+            memory_root,
+            workspace_root=self.workspace_root,
+        )
         self._register_memory_tools()
         self.tool_executor = ToolExecutor(self.tool_registry, self.permission_manager)
         self.agent_registry = AgentRegistry()
@@ -554,7 +557,8 @@ class MasterAgent(BaseAgent):
                     for item in matches
                 ],
             })
-        return self.long_term_memory.format_for_prompt(matches)
+        memory_index = await self.long_term_memory.read_index()
+        return self.long_term_memory.format_for_prompt(matches, memory_index)
 
     def _pin_memory_context(self, memory_context: str) -> None:
         self.context.remove_pinned("<retrieved_long_term_memory>")
